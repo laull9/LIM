@@ -6,6 +6,7 @@ module;
 #include <memory>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -485,32 +486,112 @@ Result<Page> SqlStore::read(const Session& session, const Read& query) {
 
 } // namespace
 
-std::expected<std::unique_ptr<Store>, StorageOpenError> open_store(const StorageOptions& options,
-                                                                   Id generation) {
-    std::unique_ptr<Database> db;
+namespace {
+
+std::expected<std::unique_ptr<Database>, StorageOpenError>
+connect_store(const StorageOptions& options, bool create) {
     try {
         if (const auto* sqlite = std::get_if<SqliteOptions>(&options)) {
             const auto path = sqlite->file.u8string();
             if (path.empty() || path == u8":memory:" || path.find(u8'\0') != path.npos) {
                 return std::unexpected(StorageOpenError::InvalidConfiguration);
             }
-            db = connect_sqlite(sqlite->file);
-        } else {
-            const auto& info = std::get<PostgresOptions>(options).connection_info;
-            if (info.empty() || info.find('\0') != info.npos) {
-                return std::unexpected(StorageOpenError::InvalidConfiguration);
-            }
-            db = connect_postgres(info);
+            return connect_sqlite(sqlite->file, create);
         }
+        const auto& info = std::get<PostgresOptions>(options).connection_info;
+        if (info.empty() || info.find('\0') != info.npos) {
+            return std::unexpected(StorageOpenError::InvalidConfiguration);
+        }
+        return connect_postgres(info);
     } catch (const DatabaseError&) {
         return std::unexpected(StorageOpenError::ConnectionFailed);
     }
+}
+
+std::expected<void, StorageOpenError> apply_recovery(Database& db,
+                                                     const StorageRecovery& recovery) {
+    Transaction transaction(db, TransactionMode::Write);
+    auto metadata =
+        db.query(db.is_postgres()
+                     ? "SELECT version, generation FROM lim_metadata WHERE singleton=1 FOR UPDATE"
+                     : "SELECT version, generation FROM lim_metadata WHERE singleton=1",
+                 {});
+    if (!metadata->next() || metadata->integer(0) != kSchemaVersion) {
+        return std::unexpected(StorageOpenError::UnsupportedSchema);
+    }
+    if (decode_id(metadata->bytes(1)) != recovery.snapshot_generation) {
+        return std::unexpected(StorageOpenError::GenerationMismatch);
+    }
+    metadata.reset();
+
+    for (const auto& session : recovery.reviewed_devices) {
+        auto device = db.query("SELECT account, revoked FROM lim_device WHERE id = $1",
+                               {Bytes(session.device.bytes)});
+        if (!device->next() || decode_id(device->bytes(0)) != session.account ||
+            device->integer(1) != 0) {
+            return std::unexpected(StorageOpenError::RecoveryDeviceMismatch);
+        }
+        if (db.query("SELECT 1 FROM lim_device WHERE credential = $1",
+                     {Bytes(session.credential.bytes)})
+                ->next()) {
+            return std::unexpected(StorageOpenError::RecoveryCredentialReuse);
+        }
+    }
+    db.exec("UPDATE lim_device SET revoked = 1 WHERE revoked = 0");
+    for (const auto& session : recovery.reviewed_devices) {
+        db.exec("UPDATE lim_device SET credential = $2, revoked = 0 WHERE id = $1",
+                {Bytes(session.device.bytes), Bytes(session.credential.bytes)});
+    }
+    db.exec("DELETE FROM lim_member WHERE device IN (SELECT id FROM lim_device WHERE revoked = 1)");
+    db.exec("UPDATE lim_metadata SET generation = $1 WHERE singleton = 1",
+            {Bytes(recovery.new_generation.bytes)});
+    transaction.commit();
+    return {};
+}
+
+} // namespace
+
+std::expected<std::unique_ptr<Store>, StorageOpenError> open_store(const StorageOptions& options,
+                                                                   Id generation) {
+    auto db = connect_store(options, true);
+    if (!db) {
+        return std::unexpected(db.error());
+    }
     try {
-        db->configure();
-        if (auto initialized = initialize(*db, generation); !initialized) {
+        (*db)->configure();
+        if (auto initialized = initialize(**db, generation); !initialized) {
             return std::unexpected(initialized.error());
         }
-        return std::make_unique<SqlStore>(std::move(db));
+        return std::make_unique<SqlStore>(std::move(*db));
+    } catch (const DatabaseError&) {
+        return std::unexpected(StorageOpenError::InitializationFailed);
+    }
+}
+
+std::expected<void, StorageOpenError> recover_store(const StorageOptions& options,
+                                                    const StorageRecovery& recovery) {
+    if (recovery.snapshot_generation == Id{} || recovery.new_generation == Id{} ||
+        recovery.snapshot_generation == recovery.new_generation) {
+        return std::unexpected(StorageOpenError::InvalidConfiguration);
+    }
+    const auto sessions = recovery.reviewed_devices;
+    for (std::size_t i = 0; i < sessions.size(); ++i) {
+        const auto& session = sessions[i];
+        if (session.generation != recovery.new_generation || session.device == Id{} ||
+            session.account == Id{} || session.credential == Id{} ||
+            std::ranges::any_of(sessions.first(i), [&](const Session& known) {
+                return known.device == session.device || known.credential == session.credential;
+            })) {
+            return std::unexpected(StorageOpenError::InvalidConfiguration);
+        }
+    }
+    auto db = connect_store(options, false);
+    if (!db) {
+        return std::unexpected(db.error());
+    }
+    try {
+        (*db)->configure();
+        return apply_recovery(**db, recovery);
     } catch (const DatabaseError&) {
         return std::unexpected(StorageOpenError::InitializationFailed);
     }

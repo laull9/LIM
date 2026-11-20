@@ -48,7 +48,7 @@ class Database {
     }
 };
 
-std::unique_ptr<Database> connect_sqlite(const std::filesystem::path& file);
+std::unique_ptr<Database> connect_sqlite(const std::filesystem::path& file, bool create);
 std::unique_ptr<Database> connect_postgres(const std::string& connection_info);
 
 } // namespace lim::storage_detail

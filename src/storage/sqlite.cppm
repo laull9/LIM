@@ -5,6 +5,7 @@ module;
 #include <functional>
 #include <initializer_list>
 #include <memory>
+#include <span>
 #include <sqlite3.h>
 #include <string>
 #include <string_view>
@@ -184,14 +185,15 @@ class SqliteDatabase final : public Database {
 
 } // namespace
 
-std::unique_ptr<Database> connect_sqlite(const std::filesystem::path& file) {
+std::unique_ptr<Database> connect_sqlite(const std::filesystem::path& file, bool create) {
     if (sqlite3_libversion_number() < 3037000) {
         throw DatabaseError{};
     }
     const auto path = file.u8string();
     sqlite3* raw = nullptr;
-    const auto rc = sqlite3_open_v2(reinterpret_cast<const char*>(path.c_str()), &raw,
-                                    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
+    const auto flags = SQLITE_OPEN_READWRITE | (create ? SQLITE_OPEN_CREATE : 0);
+    const auto rc =
+        sqlite3_open_v2(reinterpret_cast<const char*>(path.c_str()), &raw, flags, nullptr);
     std::unique_ptr<sqlite3, Close> db(raw);
     check(rc);
     return std::make_unique<SqliteDatabase>(std::move(db));

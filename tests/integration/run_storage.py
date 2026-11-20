@@ -9,7 +9,7 @@ import sqlite3
 import subprocess
 from tempfile import TemporaryDirectory
 
-from run_server import run_server
+from run_server import run_server, verify_recovery
 
 
 def run(argv, **kwargs):
@@ -62,6 +62,27 @@ def run_sqlite(test, directory, mode):
     file = directory / "lim.db"
     if mode == "server":
         run_server(test, directory, "sqlite")
+        recovery = directory / "recovery"
+        recovery.mkdir()
+
+        def backup(workspace):
+            with closing(sqlite3.connect(workspace / "server.db")) as source:
+                with closing(sqlite3.connect(workspace / "restored.db")) as restored:
+                    source.backup(restored)
+
+            def block_generation_change(enabled):
+                sql = """
+                    CREATE TRIGGER block_generation_change BEFORE UPDATE OF generation ON lim_metadata
+                    BEGIN
+                        SELECT RAISE(ABORT, 'test rejects a generation change');
+                    END
+                """ if enabled else "DROP TRIGGER block_generation_change"
+                with closing(sqlite3.connect(workspace / "restored.db")) as db, db:
+                    db.execute(sql)
+
+            return None, block_generation_change
+
+        verify_recovery(test, recovery, "sqlite", backup)
         return
     if mode == "demo":
         run_demo([test, "--sqlite", file])
@@ -101,6 +122,7 @@ def postgres_database(directory):
             env=env, stdout=subprocess.DEVNULL)
         env["PGHOST"] = str(directory)
         env["PGPORT"] = "5432"
+        env["PATH"] = f"{initdb.parent}{os.pathsep}{env.get('PATH', os.defpath)}"
 
         def execute(sql, user="lim_app", database="lim_contract"):
             run([psql, "-Xq", "-v", "ON_ERROR_STOP=1", "-U", user, "-d", database, "-c", sql],
@@ -123,6 +145,31 @@ def run_postgres(test, directory, mode):
     with postgres_database(directory) as (env, conninfo, execute):
         if mode == "server":
             run_server(test, directory, "postgresql", env, conninfo)
+            execute("CREATE DATABASE lim_recovery OWNER lim_app", "lim_fixture", "postgres")
+
+            def backup(workspace):
+                archive = workspace / "snapshot.dump"
+                run(["pg_dump", "-Fc", "-U", "lim_app", "-f", archive, "lim_recovery"], env=env)
+                execute("CREATE DATABASE lim_restored OWNER lim_app", "lim_fixture", "postgres")
+                run(["pg_restore", "--exit-on-error", "--no-owner", "-U", "lim_app",
+                     "-d", "lim_restored", archive], env=env)
+
+                def block_generation_change(enabled):
+                    sql = """
+                        CREATE FUNCTION block_generation_change() RETURNS trigger LANGUAGE plpgsql AS $$
+                        BEGIN
+                            RAISE EXCEPTION 'test rejects a generation change';
+                        END;
+                        $$;
+                        CREATE TRIGGER block_generation_change BEFORE UPDATE OF generation ON lim_metadata
+                        FOR EACH ROW EXECUTE FUNCTION block_generation_change();
+                    """ if enabled else "DROP FUNCTION block_generation_change() CASCADE"
+                    execute(sql, database="lim_restored")
+
+                return "dbname=lim_restored user=lim_app", block_generation_change
+
+            verify_recovery(test, directory, "postgresql", backup, env,
+                            "dbname=lim_recovery user=lim_app")
             return
         if mode == "demo":
             env["LIM_DEMO_PG"] = conninfo

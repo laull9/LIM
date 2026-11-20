@@ -3,6 +3,7 @@ module;
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <variant>
 #include <vector>
@@ -27,7 +28,15 @@ enum class StorageOpenError {
     ConnectionFailed,
     InitializationFailed,
     UnsupportedSchema,
-    GenerationMismatch
+    GenerationMismatch,
+    RecoveryDeviceMismatch,
+    RecoveryCredentialReuse
+};
+
+struct StorageRecovery {
+    Id snapshot_generation;
+    Id new_generation;
+    std::span<const Session> reviewed_devices;
 };
 
 struct ConversationSummary {
@@ -63,5 +72,11 @@ class Store : public Chat {
 // calls on a handle; separate handles coordinate through database transactions.
 [[nodiscard]] std::expected<std::unique_ptr<Store>, StorageOpenError>
 open_store(const StorageOptions& options, Id generation);
+
+// Operates on an existing, restored database with all other LIM handles closed.
+// Reviewed devices must be active in the snapshot and use fresh credential IDs.
+// Their snapshot memberships are retained. All other devices lose access.
+[[nodiscard]] std::expected<void, StorageOpenError> recover_store(const StorageOptions& options,
+                                                                  const StorageRecovery& recovery);
 
 } // namespace lim

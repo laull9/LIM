@@ -20,7 +20,7 @@ xmake
 xmake test --output-on-failure
 ```
 
-PostgreSQL 集成测试需要 PostgreSQL 14+ 的 `initdb`、`pg_ctl` 和 `psql`，以及 Python 3.11+。测试创建私有临时集群，通过 Unix socket 连接，结束后关闭并清理。脚本通过 `pg_config --bindir` 查找服务端工具，也可用 `LIM_PG_BINDIR` 指定目录。SQLite 集成测试每次使用新的临时文件。完整测试可在 macOS 或 Linux 的普通用户下运行。
+PostgreSQL 集成测试需要 PostgreSQL 14+ 的 `initdb`、`pg_ctl`、`psql`、`pg_dump` 和 `pg_restore`，以及 Python 3.11+。测试创建私有临时集群，通过 Unix socket 连接，结束后关闭并清理。脚本通过 `pg_config --bindir` 查找 PostgreSQL 工具，也可用 `LIM_PG_BINDIR` 指定目录。SQLite 集成测试每次使用新的临时文件。完整测试可在 macOS 或 Linux 的普通用户下运行。
 
 ```sh
 xmake test lim_frame_test/frame
@@ -109,6 +109,7 @@ lim::Result<lim::Receipt> send_reply(lim::Chat& chat, const lim::Session& sessio
 
 - [架构与存储事务](docs/architecture.md)
 - [HTTP 协议与 WebSocket 草案](docs/protocol.md)
+- [双库备份与恢复](docs/recovery.md)
 - [回环性能基准](benchmarks/README.md)
 - [加密与信任设计](docs/security.md)
 - [实施与验收](docs/roadmap.md)

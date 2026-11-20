@@ -66,8 +66,9 @@ def call(method, params=None, request_id="test"):
 
 
 class Client:
-    def __init__(self, port):
+    def __init__(self, port, tokens=TOKENS):
         self.connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        self.tokens = tokens
 
     def close(self):
         self.connection.close()
@@ -81,7 +82,7 @@ class Client:
     def raw(self, body, actor=None):
         headers = {"Content-Type": "application/json"}
         if actor:
-            headers["Authorization"] = f"Bearer {TOKENS[actor]}"
+            headers["Authorization"] = f"Bearer {self.tokens[actor]}"
         code, data = self.request("POST", "/rpc", body, headers)
         assert code in (200, 204), (code, data)
         if code == 204:
@@ -118,6 +119,101 @@ def server_config(directory, backend, env=None, conninfo=None):
     if conninfo:
         env["LIM_SERVER_PG"] = conninfo
     return config, env
+
+
+def verify_recovery(test, directory, backend, backup, env=None, conninfo=None):
+    source, env = server_config(directory, backend, env, conninfo)
+    original = json.loads(source.read_text(encoding="utf-8"))
+    recovered_generation = uid(706)
+    new_tokens = {"operator": "91" * 32, "alice": "92" * 32}
+    commands = {"generation": GENERATION, "conversation_id": ROOM}
+    send = {**commands, "client_message_id": KEY, "content_type": "text/plain",
+            "text": "before snapshot"}
+    later = {**send, "client_message_id": uid(707), "text": "only in source"}
+
+    def success(client, method, params, actor):
+        reply = client.rpc(call(method, params), actor)
+        assert "result" in reply, reply
+        return reply["result"]
+
+    with running_server(test, source, env) as port:
+        client = Client(port)
+        try:
+            success(client, "conversation.create", {**commands, "profile": "host"}, "operator")
+            for device in (ALICE, BOB):
+                success(client, "conversation.set_member",
+                        {**commands, "device_id": device, "active": True}, "operator")
+            assert success(client, "message.send", send, "alice")["seq"] == "1"
+            restored_conninfo, block_generation_change = backup(directory)
+            assert success(client, "message.send", later, "alice")["seq"] == "2"
+            success(client, "device.revoke", {"generation": GENERATION, "device_id": BOB},
+                    "operator")
+        finally:
+            client.close()
+
+    restored_env = {**env}
+    if restored_conninfo:
+        restored_env["LIM_SERVER_PG"] = restored_conninfo
+    approved = {**original["devices"][0], "credential": uid(708),
+                "token_sha256": hashlib.sha256(new_tokens["alice"].encode()).hexdigest()}
+    replacement = {**original, "generation": recovered_generation,
+                   "operator_token_sha256": hashlib.sha256(new_tokens["operator"].encode()).hexdigest(),
+                   "storage": {**original["storage"], "file": "restored.db"},
+                   "devices": [approved]}
+    new_config = directory / "restored.json"
+    command = [test, "--config", new_config, "--recover-from", source]
+
+    def attempt(config, expected, message):
+        new_config.write_text(json.dumps(config), encoding="utf-8")
+        result = subprocess.run(command, env=restored_env, capture_output=True, text=True,
+                                timeout=15)
+        assert result.returncode == expected, result
+        assert message in (result.stderr if expected else result.stdout), result
+
+    if backend == "sqlite":
+        attempt({**replacement, "storage": {"backend": "sqlite", "file": "missing.db"}},
+                1, "cannot connect")
+        assert not (directory / "missing.db").exists()
+    attempt({**replacement, "operator_token_sha256": original["operator_token_sha256"]},
+            1, "rotate all")
+    attempt({**replacement, "generation": GENERATION}, 1, "unchanged generation")
+    attempt({**replacement, "devices": [{**approved, "account": uid(709)}]},
+            1, "different account")
+    attempt({**replacement, "devices": [{**approved, "credential": uid(12)}]},
+            1, "credential ID already exists")
+    block_generation_change(True)
+    attempt(replacement, 1, "cannot apply recovery")
+    block_generation_change(False)
+    attempt(replacement, 0, f"recovered generation={recovered_generation}")
+    attempt(replacement, 1, "generation does not match")
+
+    with running_server(test, new_config, restored_env) as port:
+        old = Client(port)
+        client = Client(port, new_tokens)
+        try:
+            request = {**commands, "generation": recovered_generation, "after": "0"}
+            error(old.rpc(call("conversation.events", request), "alice"), -32001)
+            error(old.rpc(call("conversation.events", request), "bob"), -32001)
+            error(client.rpc(call("conversation.events", {**request, "generation": GENERATION}),
+                             "alice"), -32009, "recovery_required")
+            page = success(client, "conversation.events", request, "alice")
+            assert page["up_to"] == "1" and len(page["events"]) == 1, page
+            assert base64.b64decode(page["events"][0]["payload_base64"]) == b"before snapshot", page
+            replay = success(client, "message.send", {**send, "generation": recovered_generation},
+                             "alice")
+            assert replay["seq"] == "1" and replay["replayed"], replay
+            join = {**commands, "generation": recovered_generation, "device_id": BOB, "active": True}
+            error(old.rpc(call("conversation.set_member", join), "operator"), -32003)
+            error(client.rpc(call("conversation.set_member", join), "operator"),
+                  -32001, "device_revoked")
+            written = success(client, "message.send",
+                              {**later, "generation": recovered_generation, "text": "after restore"},
+                              "alice")
+            assert written["seq"] == "2" and not written["replayed"], written
+        finally:
+            old.close()
+            client.close()
+    print("backup restored with fresh generation, reviewed access and intact history", flush=True)
 
 
 def binary_header(room, key, content_type="application/octet-stream"):
