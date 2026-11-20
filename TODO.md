@@ -26,5 +26,5 @@
 - [x] 验证 SQLite 备份和 PostgreSQL 转储的恢复代次切换、令牌轮换与历史保留。
 - [ ] 实现鉴权后的 WebSocket 会话通知，验证重连与慢连接回收。
 - [ ] 选定 MLS 实现，验证真实客户端、密钥轮换、撤销和离线恢复。
-- [ ] 验证 Linux xmake CI。
+- [x] 验证 Linux xmake CI 的 Debug 和 Release 矩阵。
 - [ ] 实测 256 在线连接下的内存和延迟预算。
