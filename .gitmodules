@@ -1,0 +1,3 @@
+[submodule "inc/ltool"]
+    path = inc/ltool
+    url = https://github.com/laull9/ltool.git

@@ -1,31 +1,102 @@
 # LIM
 
-LIM 是一个可嵌入的轻量聊天服务器。目标部署形态是一个 `lim-server` 进程和本机 SQLite 数据目录。C++ 应用也可以把同一套会话、发送、补齐接口链接进自己的进程。单聊、邀请制小群和 Agent Harness 共用一条按会话排序的事件日志。
+LIM 是面向单聊、小群和 Agent Harness 的轻量聊天服务器项目。当前可作为 C++23 库嵌入宿主进程，支持用 SQLite 文件或 PostgreSQL 数据库持久化宿主可读会话。两种后端使用同一个有序事件日志契约，支持发送、分页补齐、幂等重试、设备授权与撤销、重新加入和保留期清理。`lim-server` 提供本地 HTTP JSON-RPC 2.0 和二进制 HTTP，支持设备认证、会话管理、发送、补齐和长轮询。WebSocket 与 MLS 端到端加密在后续路线中。
 
-普通聊天默认采用 MLS 端到端加密。需要读取上下文的 Agent 可以作为受邀的加密端点入群；受信宿主还可以显式创建宿主可读的会话，直接保存文本、JSON 或字节。会话建立后固定内容模式。
+| xmake 目标 | 模块 | 职责 |
+| --- | --- | --- |
+| `lim_core` | `lim.chat`、`lim.frame` | 发送与补齐接口、值类型、有界二进制拆帧 |
+| `lim_storage` | `lim.storage` | 运行时选择 SQLite 或 PostgreSQL，初始化存储并实现 `Chat` 与可信宿主管理 |
+| `lim-server` | 独立服务 | JSON-RPC 2.0、二进制 HTTP 和长轮询 |
+| `lim_frame_test`、`lim_storage_test` | 测试入口 | 拆帧单测与两种真实数据库的共享契约测试 |
 
-## 当前可用
+## 构建与测试
 
-- C++23 静态库目标 `lim::core`。模块 `lim.chat` 导出身份、消息、回执、分页及同步调用接口；`lim.frame` 实现有界、借用输入的二进制拆帧。
-- 可单独执行的 SQLite 日志设计和约束测试。服务监听、C++ SQLite 适配器、凭据管理和 MLS 客户端仍在实施路线中。目前没有可运行的 IM 守护进程。
-- 源码集成使用 `add_subdirectory(path/to/LIM)` 和 `target_link_libraries(my_app PRIVATE lim::core)`，然后在 C++23 消费目标中 `import lim.chat;`。同一工具链从源码构建模块。
+需要 xmake 3.1.2+、支持 C++23 命名模块和 `std::expected` 的工具链，以及 pkg-config 能找到的 SQLite 3.37+ 和 libpq 14+ 开发包。Clang 工具链需要同版本的 `clang-scan-deps`。使用包管理器安装系统库，配在非标准目录时用 `PKG_CONFIG_PATH` 指向对应的 `.pc` 目录。
 
-| 从哪里读 | 内容 |
-| --- | --- |
-| [系统架构](docs/architecture.md) | 嵌入与部署、宿主边界、SQLite 写入、内存预算 |
-| [协议](docs/protocol.md) | HTTP/WS、Agent 消息示例、幂等与补齐 |
-| [加密与信任](docs/security.md) | MLS、设备授权、宿主可读会话的信任边界 |
-| [实施与验收](docs/roadmap.md) | 发布切片、可重现的内存和延迟验收 |
-| [日志结构](design/sqlite/event_log.sql) | 可执行的 SQLite 事件与幂等约束草案 |
+```sh
+git submodule update --init inc/ltool
+xmake f -m debug --toolchain=clang -o build/xmake
+xmake
+xmake test --output-on-failure
+```
 
-## Agent 侧的调用形状
+PostgreSQL 集成测试需要 PostgreSQL 14+ 的 `initdb`、`pg_ctl` 和 `psql`，以及 Python 3.11+。测试创建私有临时集群，通过 Unix socket 连接，结束后关闭并清理。脚本通过 `pg_config --bindir` 查找服务端工具，也可用 `LIM_PG_BINDIR` 指定目录。SQLite 集成测试每次使用新的临时文件。完整测试可在 macOS 或 Linux 的普通用户下运行。
 
-宿主为每次逻辑答复生成并持久化一个 UUID，和已经编码的字节一起保存。重试时取回两者。下面的函数可由宿主的写入线程调用；具体 Chat 适配器由宿主注入。
+```sh
+xmake test lim_frame_test/frame
+xmake test lim_storage_test/sqlite
+xmake test lim_storage_test/postgresql
+
+# Release 使用相同的测试入口
+xmake f -m release --toolchain=clang -o build/xmake
+xmake test --output-on-failure
+```
+
+## 编辑器索引
+
+Clice 读取 `build/ide/compile_commands.json`。xmake 构建时自动刷新编译数据库，模块、编译器及依赖参数取自当前构建配置。只更新索引参数时运行下面的命令。
+
+```sh
+xmake project -k compile_commands --lsp=clangd build/ide
+```
+
+在 VS Code 打开 LIM 根目录。首次切换配置后，可在命令面板运行 `clice: Restart Language Server` 重新加载。
+
+## 独立服务
+
+`lim-server` 使用 LTool 的 LWeb 和 LJson，通过 `--config FILE` 启动。依赖、设备和操作员凭据配置、方法表及请求示例见 [JSON-RPC 2.0](docs/rpc.md)。原始正文收发和低开销在线提示见 [二进制 HTTP](docs/protocol.md)。
+
+## 首版 demo
+
+每条命令启动一个独立进程。Alice 和 Bob 是可信宿主中的两个演示身份，共用一个持久化会话。下面用新的 SQLite 文件演示双向收发、退出后的补齐和幂等重试。
+
+```sh
+xmake build lim_demo
+demo_db="$(mktemp -d)/lim-demo.db"
+
+xmake run lim_demo --sqlite "$demo_db" init
+xmake run lim_demo --sqlite "$demo_db" send alice 1 '你好，Bob'
+xmake run lim_demo --sqlite "$demo_db" read bob 0
+xmake run lim_demo --sqlite "$demo_db" send bob 1 '你好，Alice'
+xmake run lim_demo --sqlite "$demo_db" read alice 1
+xmake run lim_demo --sqlite "$demo_db" send alice 1 '你好，Bob'
+```
+
+第一次发送依次拿到序号 `1` 和 `2`。最后一条命令返回 `accepted seq=1 replayed=true`。消息键是每个发送者独立使用的正整数，同一个键须搭配原文重试。翻页时把 `next_after` 作为下一次 `read` 的游标，也可以附上首次返回的 `up_to` 固定本轮补齐上界。
+
+PostgreSQL 使用单独的演示数据库。数据库角色需要有相应的 schema 建表权限。以下示例使用 libpq 默认的本机连接设置。
+
+```sh
+createdb lim_demo
+export LIM_DEMO_PG='dbname=lim_demo'
+xmake run lim_demo --postgresql init
+xmake run lim_demo --postgresql send alice 1 '你好，Bob'
+xmake run lim_demo --postgresql read bob 0
+```
+
+通过 `xmake test 'lim_demo/*'` 在两个隔离的真实数据库中重现演示。
+
+## 嵌入宿主
+
+在宿主的 `xmake.lua` 中引入 LIM 源码，同一工具链会构建双方使用的模块。
+
+```lua
+includes("vendor/LIM")
+
+target("my_app")
+    set_kind("binary")
+    set_languages("cxx23")
+    add_deps("lim_storage")
+    add_files("src/main.cppm")
+```
+
+`open_store` 接受 `SqliteOptions{file}` 或 `PostgresOptions{connection_info}`，并接收宿主持久保存的恢复代次 ID。SQLite 文件的父目录由宿主创建。PostgreSQL 使用专用数据库和能在 `public` schema 建表的数据库角色，连接串由宿主配置，可用 libpq 的环境变量及凭据文件补充。初始化后重复打开必须提供同一恢复代次。
 
 ```cpp
 #include <cstddef>
 #include <span>
-import lim.chat;
+
+import lim.storage;
 
 lim::Result<lim::Receipt> send_reply(lim::Chat& chat, const lim::Session& session,
                                      lim::Id room, lim::Id message_id,
@@ -34,23 +105,11 @@ lim::Result<lim::Receipt> send_reply(lim::Chat& chat, const lim::Session& sessio
 }
 ```
 
-## 构建与验证
+宿主先认证设备，通过 `register_device` 登记与该设备绑定的内部凭据 ID，再通过 `create_host_conversation` 和 `set_member` 配置会话访问。宿主验证 JSON 或 UTF-8，存储保留原始字节。一次逻辑发送使用稳定的客户端消息 ID，超时重试复用原始字节和 ID。每个存储句柄由宿主串行调用。
 
-CMake 入口要求 3.28+ 和 Ninja 1.11+。xmake 入口要求 3.0.6+。C++ 编译器与标准库需支持 named modules 和 `std::expected`。Linux x86-64 已验证 GCC/libstdc++ 14.2、CMake 3.31.6、Ninja 1.11.1 与 xmake 3.0.6；核心无需下载第三方包。使用 clang-format 19 的 LLVM 风格。
-
-```sh
-cmake --preset debug
-cmake --build build/cmake/Linux/debug
-ctest --test-dir build/cmake/Linux/debug --output-on-failure
-
-xmake f -m debug -o build/xmake
-xmake build lim_frame_test
-xmake test
-
-# 可选的存储设计验证，Python 3.11+ 与 SQLite 3.37+
-python3 design/sqlite/check_event_log.py
-```
-
-本次 Linux 验证中，ASan 拆帧测试通过（运行环境限制，关闭 leak 检查）。GCC 14.2 在启用 UBSan 编译模块接口时出现内部编译器错误，UBSan 验证待换工具链复测。
-
-Release 构建可选 `cmake --preset release` 并构建对应的 release 目录，或 `xmake f -m release -o build/xmake && xmake`。贡献规范见 [AGENTS.md](AGENTS.md)。
+- [架构与存储事务](docs/architecture.md)
+- [HTTP 协议与 WebSocket 草案](docs/protocol.md)
+- [回环性能基准](benchmarks/README.md)
+- [加密与信任设计](docs/security.md)
+- [实施与验收](docs/roadmap.md)
+- [工程约定](AGENTS.md)

@@ -1,6 +1,8 @@
 # LIM v1 协议草案
 
-独立服务与嵌入调用共享提交与补齐语义。HTTP 承担发送和分页，因此脚本、机器人可只使用 HTTP。WebSocket 子协议 `lim.v1` 为在线客户端提供提示和可选的低延迟提交。以下路由是实现契约；目前可运行的部分是二进制外框拆分。
+独立服务与嵌入调用共享提交与补齐语义。已实现宿主可读会话的二进制 HTTP 发送、分页与长轮询。设备使用 `Authorization: Bearer <token>`，建群、成员管理、会话目录和设备撤销使用 [HTTP JSON-RPC 2.0](rpc.md)。两个入口共享幂等键和会话序号。
+
+WebSocket 子协议 `lim.v1`、MLS 控制面和下表中标注为计划的路由属于后续协议。当前服务只监听 IPv4 回环，部署与凭据配置见 [JSON-RPC 启动说明](rpc.md#启动)。
 
 ## 字段与记录
 
@@ -34,15 +36,18 @@
 
 | 操作 | 输入 | 成功结果 |
 | --- | --- | --- |
-| `POST /v1/conversations` | 已认证创建者、幂等键、成员和模式；MLS 另附初始公开材料与逐设备 Welcome | 新会话 ID、模式、起始游标 |
-| `POST /v1/conversations/{id}/messages` 或 WS binary `message.send` | 单条应用记录 | HTTP 200 或 WS text `message.accepted`，首次与重试均含原序号 |
+| `POST /v1/conversations`（计划） | 已认证创建者、幂等键、成员和模式；MLS 另附初始公开材料与逐设备 Welcome | 新会话 ID、模式、起始游标 |
+| `POST /v1/conversations/{id}/messages` | `application/vnd.lim.record`，包含 JSON 头和原始正文 | HTTP 200 JSON `message.accepted`，首次与重试均含原序号 |
 | `GET /v1/conversations/{id}/events?after_seq=41&up_to=48` | 排除下界，可选固定上界；HTTP 头 `LIM-Generation` 必填 | 二进制事件页 |
-| `GET /v1/sync/catalog` | 代次与可选目录游标 | 首次返回设备可见会话、加入下界、各房间高水位和目录游标；增量返回成员/设备可见性变化 |
-| WS text `subscribe` / `unsubscribe` | 认证后、带代次的会话集合，每连接至多 64 项 | 复查成员权限后确认；在线 `sync.hint` 含代次、会话、高水位 |
-| `POST /v1/conversations/{id}/commits`、`GET /v1/conversations/{id}/welcome` | MLS 成员变更、预期 epoch 或设备身份 | 原子写入控制事件并分发设备专属 Welcome |
+| `GET /v1/conversations/{id}/wait?after_seq=48` | 当前已同步序号，HTTP 头 `LIM-Generation` 必填 | HTTP 200 JSON `sync.hint` 或 204 等待超时 |
+| `GET /v1/sync/catalog`（计划） | 代次与可选目录游标 | 首次返回设备可见会话、加入下界、各房间高水位和目录游标；增量返回成员/设备可见性变化 |
+| WS text `subscribe` / `unsubscribe`（计划） | 认证后、带代次的会话集合，每连接至多 64 项 | 复查成员权限后确认；在线 `sync.hint` 含代次、会话、高水位 |
+| `POST /v1/conversations/{id}/commits`、`GET /v1/conversations/{id}/welcome`（计划） | MLS 成员变更、预期 epoch 或设备身份 | 原子写入控制事件并分发设备专属 Welcome |
 | `GET /health/live`、`GET /health/ready` | 本地管理监听 | 进程存活、数据库与接单状态 |
 
-账号/设备登记、令牌刷新与撤销、KeyPackage 上传/一次性领取属于身份与 MLS 控制面，见[信任设计](security.md)。WS 先接收一次性挑战，再提交 `session.authenticate`，通过后得到 `session.ready` 与当前代次。HTTP 每次请求校验设备绑定的访问凭据；登录入口与撤销同时管理这些凭据。未认证连接最多保留 5 秒及两个控制帧。默认 30 秒 ping，60 秒无响应关闭。
+当前 HTTP 服务每次请求校验设备绑定的访问凭据，设备令牌由服务配置提供。计划中的账号与设备登记、令牌刷新、KeyPackage 上传及一次性领取见[信任设计](security.md)。
+
+计划中的 WebSocket 先接收一次性挑战，再提交 `session.authenticate`，通过后得到 `session.ready` 与当前代次。未认证连接最多保留 5 秒及两个控制帧。默认 30 秒 ping，60 秒无响应关闭。
 
 回执示例：`{"v":1,"type":"message.accepted","request_id":"r42","recovery_generation":"01900000-0000-4000-8000-000000000004","conversation_id":"01900000-0000-4000-8000-000000000001","conversation_seq":"42","replayed":false}`。
 
@@ -54,6 +59,12 @@
 2. 已有键且内容相同，返回原序号并置 `replayed=true`，即使当前 epoch 已推进。已有键且内容不同返回冲突。已清理正文的键返回过期错误和原序号。
 3. 对新键再检查当前模式、epoch、冻结和配额，事务内写入事件；只有提交成功才返回 accepted。accepted 表示服务端已保存。用户已读回执由终端另发应用消息。
 4. 超时或断线视为结果未知，重试复用原键和原始字节。明确收到 epoch 冲突时先补齐，再重新加密。设备在发送前原子保存待发字节、幂等键及 MLS 状态。
+
+## HTTP 长轮询
+
+客户端先拉取事件页，再以最后已持久化的序号调用 `/wait`。响应 200 包含 `type: "sync.hint"`、会话 ID、恢复代次及当前 `up_to`，收到后继续拉取事件。5 秒内无变更返回 204，两种成功响应都带 `LIM-Generation` 和 `LIM-Up-To`。收到 204 后可以复用原游标发起下一次等待。
+
+服务每次准备返回提示时复查权限和保留边界。被移除的设备收到 404，已撤销设备收到 401，过期游标收到 410 及当前下界。最多 16 个并发等待，请求过载返回 503 和 `Retry-After`。等待计时在网络线程挂起，数据库工作线程仅执行短检查。本进程提交后通常在下一次 100 ms 检查点唤醒等待者，外部写入由每秒的数据库检查发现。
 
 ## 补齐和订阅
 

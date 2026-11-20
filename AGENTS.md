@@ -10,25 +10,24 @@
 
 | 项目 | 默认约定 |
 | --- | --- |
-| 语言标准 | C++20 为最低基线；C++23/26 特性按实际工具链能力启用 |
-| 构建入口 | 同时维护 CMake 和 xmake；默认以 CMake 为文档中的主入口，可按项目决定调整 |
+| 语言标准 | C++23，使用命名模块和 `std::expected` |
+| 构建入口 | 仅维护 xmake |
 | 标准扩展 | 本项目默认禁用 GNU 等非标准扩展；平台必需扩展集中封装 |
 | 代码格式 | LLVM 风格基础，4 空格，100 列，左侧指针／引用符号 |
-| 文件 | UTF-8、LF、文件末尾换行；C++ 源文件 `.cpp`，头文件 `.hpp` |
+| 文件 | UTF-8、LF、文件末尾换行；自有 C++ 代码优先使用 `.cppm`，包括模块接口、实现单元和内部分区 |
 | 命名 | 英文标识符；类型 `PascalCase`，函数／变量／命名空间 `snake_case` |
 | 注释与文档 | 代码注释默认英文，面向维护者的文档默认中文；已有项目遵循其语言约定 |
 | 内存与资源 | 值语义和 RAII；独占所有权优先，共享所有权须有实际用途 |
 | 异常与 RTTI | 默认保留；禁用必须源于平台或产品要求，并有统一替代方案 |
 | 第三方依赖 | 先评估标准库和已有依赖；新增依赖须有明确收益并固定版本 |
 | 构建产物 | 按构建系统、平台、架构、配置分离，不写入 `src/`、`include/` 等源码目录或版本控制 |
-
-这些是本项目的工程选择，不表示 C++ 语言要求所有项目采用相同风格。
+| TODO.md | 保持精简、实时更新，300行以内，过时进度及时清理 |
 
 ## 2. AI 修改代码的工作方式
 
 1. 修改前阅读本目录规则、构建入口、相关实现、调用方和测试；先理解所有权、错误契约和平台限制，再编辑。
 2. 实现当前需求的最小完整方案。修复根因，不增加无关功能，不顺手改公共 API、格式或目录结构。
-3. 优先复用现有模块和标准设施。没有明确复用需求，不创建通用框架、服务定位器、多层工厂或自定义对象系统。
+3. 新增外部依赖前先评估 `inc/ltool` 已有能力，优先复用适合的 LTool 接口。需要外部组件时说明缺口和版本，只接入必要的小库。禁止引入整套 Boost，网络组件按实际使用的 Asio、Beast 等独立依赖评估。优先复用现有模块和标准设施。没有明确复用需求，不创建通用框架、服务定位器、多层工厂或自定义对象系统。
 4. 不确定 API、标准版本或编译选项时，查询对应版本的官方文档、仓库代码，必要时做最小编译验证。不得凭记忆编造接口。
 5. 常规、可逆的实现选择自主完成并说明关键假设；需求不明且会改变公共行为、数据格式或兼容性时再澄清。
 6. 保留用户已有改动。避免大面积改写第三方、生成文件或不相关模块；版本控制操作遵循当前任务授权。
@@ -84,16 +83,18 @@ AllowShortLoopsOnASingleLine: false
 | `apps/` | 多个可执行程序的薄入口；单一应用的入口可留在 `src/` |
 | `tests/` | 行为测试、回归用例和小型测试数据 |
 | `benchmarks/` | 可复现的性能基准，存在实际测量需求时再建立 |
-| `cmake/`、`scripts/` | 构建辅助与开发脚本 |
+| `scripts/` | 构建辅助与开发脚本 |
 | `docs/` | 架构、兼容性、设计决策和使用说明 |
 
 - 模块按领域职责拆分，避免全部堆入 `utils.hpp`。依赖方向清楚，不形成循环依赖；入口负责组装，不承载大量业务逻辑。[2]
+- 新增自有 C++ 接口和实现优先用命名模块，文件统一用 `.cppm`。公共契约在接口单元用 `export` 明确声明，跨文件内部定义优先放到非导出的模块分区。
+- `main` 仍属于全局模块。仓库用 `.cppm` 维护测试入口，由 xmake 按普通翻译单元编译。仅在工具链、C ABI 或第三方接口需要传统组织时使用 `.cpp` 或 `.hpp`。
 - 头文件必须能独立包含。直接包含所使用设施的声明头，不依赖传递包含或预编译头碰巧提供声明。[3]
 - 具有对应接口头的 `.cpp` 首先包含该头，再按项目配置组织其他头；不包含 `.cpp`、`bits/stdc++.h` 或整包巨型便利头。
 - 头文件使用 `#pragma once`；目标工具链有特殊要求时使用带项目前缀的 include guard。不要重复叠加两套防护。
 - 禁止头文件中的 `using namespace`；实现文件也不使用全局 `using namespace std`。需要时在小作用域引入具体名称。
-- 非模板、非必要内联的实现放入 `.cpp`；模板、`constexpr` 和必要内联定义按语言要求放置。头文件定义变量时正确处理 ODR，命名常量优先 `inline constexpr`。
-- 内部辅助函数限制在 `.cpp` 的匿名命名空间。禁止向 `std` 添加普通声明；只有标准明确允许的特化才能进入 `std`。
+- 非模板、非必要内联的实现放入模块实现单元；模板、`constexpr` 和必要内联定义按语言要求放置。头文件定义变量时正确处理 ODR，命名常量优先 `inline constexpr`。
+- 内部辅助函数限制在翻译单元的匿名命名空间。禁止向 `std` 添加普通声明；只有标准明确允许的特化才能进入 `std`。
 - 前置声明只用于本项目可控类型且确有解耦收益的场景；不手工前置声明标准库类型或猜测第三方内部声明。
 - 不把 PImpl、header-only 或 C++ modules 作为全项目硬要求；根据 ABI、编译时间和工具支持选择。[2]
 
@@ -106,9 +107,9 @@ AllowShortLoopsOnASingleLine: false
 - 连续序列优先 `std::vector`／`std::array`；可选值用 `std::optional`，有限互斥状态考虑 `std::variant`，时长用 `std::chrono`，路径用 `std::filesystem::path`。
 - 算法和 ranges 在比循环更清晰时使用；不以长管道、深层模板或嵌套 lambda 牺牲调试性。泛型接口优先 concepts／`requires`，避免新增难读的 SFINAE 技巧。
 - 常量和简单逻辑优先 `constexpr`、枚举、函数或模板，避免函数式宏；平台判断、导出和条件编译宏集中管理。
-- C++23 的 `std::expected`、`std::print`、`std::ranges::to` 等不得直接混入 C++20 基线。先确认编译器、标准库、部署目标和两套构建的支持，再升级基线或提供统一兼容层。[25]
+- 使用 C++23 标准库特性前，核对 xmake 工具链和目标平台的实际支持。[25]
 - 检查库特性测试宏及最小编译探针；仅能接受 `-std=c++23` 不等于已实现相应标准库。不要滥用 `__cplusplus` 一次性推断所有特性。
-- modules、协程和更新标准特性按实际需要引入，并验证格式化、静态分析、依赖扫描与双构建流程；不为“现代化”重写已清楚可靠的代码。
+- modules、协程和更新标准特性按实际需要引入，并验证格式化、静态分析、依赖扫描与xmake 构建；不为“现代化”重写已清楚可靠的代码。
 
 ## 6. 资源、所有权与生命周期
 
@@ -164,65 +165,30 @@ AllowShortLoopsOnASingleLine: false
 - 不引入未经论证的无锁结构或弱内存序；使用时说明同步关系和验证方法。简单互斥锁能满足需求时保持简单。
 - 协程跨挂起点保存的数据必须仍有效；默认不跨挂起点持锁。带捕获的协程 lambda 需特别审查闭包生命周期，捕获 `shared_ptr` 也不能自动消除闭包销毁风险。[11]
 
-## 10. CMake 与 xmake 双构建规范
+## 10. xmake 构建规范
 
-### 10.1 共同要求
-
-- 两个入口使用同一套业务源码、公共头和测试源码；能够各自从干净环境独立完成文档承诺的构建。
-- 新增／删除／移动源文件，改变依赖、宏、平台库、资源生成或特性开关时同步维护两个入口。
-- 保持实际语义一致：语言基线、依赖版本及配置、异常／RTTI、运行库、浮点语义、公共宏、线程支持、默认特性、测试及承诺的安装内容。
-- 构建输出分别放在 `build/cmake/`、`build/xmake/` 下，并区分平台、架构和配置。不混用对象文件、缓存或另一套构建的中间产物；xmake 的 `.xmake/` 配置缓存也加入忽略。
-- 每个目标显式声明源码。避免全仓递归通配把测试入口、实验代码和平台专用实现误编进产品；CMake 不用 `GLOB/GLOB_RECURSE` 代替源码清单。[12]
-- 编译配置尽量附着到目标，私有选项不泄漏给下游；三方依赖不继承本项目的严格告警或 `-Werror`。
-- 只维护必要的辅助函数；不为两份短配置自建复杂构建生成器。自动导出工程文件不能替代双入口行为验证。
-- README 写清最低工具版本、实际验证的平台、开发／发布／测试命令和可选功能；缺失必需能力时明确报错，不静默降级。
-
-### 10.2 CMake
-
-- 使用 `target_sources`、`target_compile_features`、`target_include_directories`、`target_compile_definitions`、`target_link_libraries` 等目标命令。
-- 使用 `target_compile_features(target PRIVATE cxx_std_20)` 表达最低标准；公共头需要该标准时用 `PUBLIC`，接口库用 `INTERFACE`。本项目编译目标设置 `CXX_EXTENSIONS OFF`。[13]
-- 不覆盖全局 `CMAKE_CXX_FLAGS`，不通过手写 `-std=` 管理语言版本，不使用全局 include／link 路径掩盖依赖关系。
-- `PRIVATE` 是默认作用域；只有消费者确实需要的使用要求才设为 `PUBLIC/INTERFACE`。安装接口不得泄漏开发机绝对路径。[14]
-- 按编译器前端选择 flags；clang-cl 属于 MSVC 风格，不能仅凭编译器 ID 是 Clang 就传入整套 GCC flags。使用前端识别变量时匹配项目最低 CMake 版本。[15]
-- 提交共享 `CMakePresets.json`，忽略个人 `CMakeUserPresets.json`。Ninja／Makefile 生成器下启用 `CMAKE_EXPORT_COMPILE_COMMANDS`；其他生成器不能假定会导出编译数据库。[16]
-- 用导出目标消费依赖；使用 `FetchContent` 时固定不可变 commit 或校验过的归档。平台线程库通过构建系统识别，不硬编码某个平台的链接参数。[17]
-- 测试接入 CTest，允许通过 `BUILD_TESTING` 关闭；发布库时按需求补充 install／export 并验证独立消费者。
-
-### 10.3 xmake
-
-- 在目标作用域使用 `set_languages("cxx20")`；不要默认 `gnuxx20` 或随工具升级变化的 `cxxlatest`。公共使用要求显式标记 `{public = true}`／`{interface = true}`。[18]
-- 优先使用 `add_files`、`add_deps`、`add_packages`、`add_includedirs`、`add_defines` 等语义 API，不用全局 flags 模拟所有目标配置。
-- 默认 `set_warnings("allextra")`；与 CMake 的告警强度按工具链核对。xmake 可能忽略不支持的原始 flags 并告警，必要的 ABI、Sanitizer 等设置必须核实生效，不可直接忽略这类警告。[19]
-- 使用包管理时固定依赖版本，在根作用域启用 `set_policy("package.requires_lock", true)`，提交 `xmake-requires.lock`；两套入口解析到等价的版本和编译配置。[20]
-- 通过 `add_tests` 注册测试并用 `xmake test` 执行；该内置机制需要 xmake 2.8.5 或更新版本。[21]
-- 用 `xmake project -k compile_commands` 生成编译数据库，切换配置后更新；clangd／clang-tidy 必须读取当前配置对应的数据库。[22]
-- Sanitizer 使用 `build.sanitizer.address`、`build.sanitizer.undefined`、`build.sanitizer.thread` 等 policy，按平台和工具链检测支持情况。[19]
-- 明确优化级别的真实映射；`set_optimize("fastest")` 在 MSVC 下可能带入 `/fp:fast`，不可默认认为它只改变优化强度。[18]
-
-### 10.4 基础命令参考
-
-优先使用仓库已有 presets／脚本。以下命令假设已经存在对应构建脚本和已注册测试；CMake 示例使用 Ninja 单配置生成器，未安装 Ninja 时选择项目支持的生成器。
+- xmake 是 LIM 的唯一构建入口。每个目标声明源码归属目录、依赖、模块可见性和语言标准。C++ 目标在目标作用域使用 `set_languages("cxx23")`。[18]
+- 能通过稳定约定自动完成的重复工作，优先自动化。xmake 按目标归属目录用 `*.cppm` 收集源码，新增常规模块无需改构建清单。公共模块放在领域目录的 `public/` 下并标记为 `public`，实现和内部模块按各自目录收集。仅平台条件、生成文件或特殊编译选项需要单独声明，避免跨目标的全仓递归扫描。
+- 构建输出放在 `build/xmake/` 下，区分平台、架构和配置。`.xmake/` 配置缓存及编译数据库不提交版本控制。
+- 依赖通过 `add_deps`、`add_packages` 等目标 API 声明，私有编译选项和数据库驱动头不泄漏给嵌入方。
+- SQLite 与 libpq 通过 pkg-config 消费系统开发包，构建配置明确最低版本。引入由 xmake 下载的依赖时固定版本并提交 `xmake-requires.lock`。[20]
+- 通过 `add_tests` 注册单元测试与集成测试。SQLite 和 PostgreSQL 跑同一套存储契约，测试使用独立临时数据库。[21]
+- xmake 构建自动刷新 `build/ide/compile_commands.json`。该路径供 Clice 使用，手动刷新使用 `xmake project -k compile_commands --lsp=clangd build/ide`。Sanitizer 通过 xmake policy 启用，并检查参数覆盖编译和链接。[19][22]
 
 ```sh
-cmake -S . -B build/cmake/debug -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-cmake --build build/cmake/debug --parallel
-ctest --test-dir build/cmake/debug --output-on-failure
-
 xmake f -m debug -o build/xmake
 xmake
-xmake test
-xmake project -k compile_commands
+xmake test --output-on-failure
 ```
 
-支持的工具链可单独配置 xmake 的 ASan＋UBSan 检查；TSan 使用另一份配置，不与 ASan 合并：
+ASan 与 UBSan 使用支持相应检查的工具链。TSan 用单独配置。
 
 ```sh
 xmake f -m debug -o build/xmake/asan --policies=build.sanitizer.address,build.sanitizer.undefined
-xmake
-xmake test
+xmake test --output-on-failure
 ```
 
-`xmake f` 会更新当前工程配置，切回普通构建时显式恢复其 policies。并行维护不同配置时使用独立工作目录；不能把仅设置输出目录视为完全隔离配置。
+`xmake f` 会更新当前工程配置，切回普通构建时显式恢复 policies。不同配置并行执行时使用独立工作目录。
 
 ## 11. 告警、静态分析与测试
 
@@ -232,7 +198,7 @@ xmake test
 - 内存和生命周期敏感改动运行支持平台上的 ASan＋UBSan；并发改动按需运行独立 TSan。Sanitizer 需要正确覆盖编译和链接，且只能发现实际执行到的部分问题。[9][24]
 - 测试验证行为与契约：正常输入、边界、失败路径和对应回归；不为凑覆盖率复制实现逻辑，不只断言“没有崩溃”。不为纯格式或文字修改编写测试。
 - 复用现有测试框架，避免混入第二套。测试应可重复；隔离临时文件、端口和全局状态，控制时钟和随机源，不依赖公网可用性或执行顺序。
-- CMake 与 xmake 注册相同的必要测试。实际检查测试数量和失败传播；“发现 0 个测试”不能当作功能已验证。
+- 构建入口注册完整的必要测试。实际检查测试数量和失败传播；“发现 0 个测试”不能当作功能已验证。
 
 按改动风险选择验证范围，达到目的后停止重复检查：
 
@@ -242,13 +208,13 @@ xmake test
 | 普通实现修改 | 主入口增量构建＋受影响的行为测试 |
 | 错误修复 | 能捕获该问题的回归用例＋相关测试 |
 | 公共头／模板／ABI | 受影响消费者、承诺支持的编译器或针对性编译用例 |
-| 构建／依赖／平台条件 | 两个入口独立配置与构建＋对应测试 |
+| 构建／依赖／平台条件 | xmake 干净配置与构建＋对应测试 |
 | 发布 | 按 README 承诺的矩阵验证干净构建、测试和实际分发／安装行为 |
 
 ## 12. 编译成本、依赖与发布
 
 - 引入大模板库、header-only 依赖或公共头重型包含前，评估冷构建、增量构建、链接时间与产物体积。没有测量结果，不宣称某种写法“零成本”或“更快”。
-- 常规实现放 `.cpp`，减少头文件传递依赖；编译瓶颈确认后再考虑显式模板实例化、PCH、modules、unity build 或构建缓存。
+- 常规实现放模块实现单元，减少接口依赖；编译瓶颈确认后再考虑显式模板实例化、PCH、modules、unity build 或构建缓存。
 - PCH／unity build 不能掩盖缺失 include 或 ODR 问题。采用这些加速方案的项目保留普通独立编译的验证方式。
 - 本地优先增量构建，不因小改动删除全部构建目录、全局依赖缓存或编译缓存；只清理明确失效的最小范围。
 - 性能优化以代表性 Release 基准为依据，说明输入、编译器、优化配置和测量方式。避免为微小收益增加长期维护负担。
@@ -263,7 +229,7 @@ xmake test
 
 - 改动满足实际需求，没有无关重构、占位实现或未说明的行为变化。
 - 所有权、借用生命周期、错误路径、数值边界和并发关闭逻辑已经检查。
-- 涉及工程元数据时，两套构建、依赖锁定和必要测试已同步。
+- 涉及工程元数据时，xmake 构建、依赖和必要测试已同步。
 - 适当范围的格式、构建、测试或分析已完成；失败与未验证项如实说明。
 - 文档反映当前行为；diff 中没有意外产物、凭据、绝对路径或用户改动丢失。
 
@@ -282,12 +248,6 @@ xmake test
 9. [Clang UndefinedBehaviorSanitizer](https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html)
 10. [C++ working draft：数据竞争](https://eel.is/c++draft/intro.races)
 11. [Clang Tidy：带捕获的协程 lambda](https://clang.llvm.org/extra/clang-tidy/checks/cppcoreguidelines/avoid-capturing-lambda-coroutines.html)
-12. [CMake file 命令：源码 GLOB 的限制](https://cmake.org/cmake/help/latest/command/file.html#glob)
-13. [CMake target_compile_features](https://cmake.org/cmake/help/latest/command/target_compile_features.html) 与 [CXX_EXTENSIONS](https://cmake.org/cmake/help/latest/prop_tgt/CXX_EXTENSIONS.html)
-14. [CMake target_include_directories](https://cmake.org/cmake/help/latest/command/target_include_directories.html)
-15. [CMake 编译器前端识别](https://cmake.org/cmake/help/latest/variable/CMAKE_LANG_COMPILER_FRONTEND_VARIANT.html)
-16. [CMake Presets](https://cmake.org/cmake/help/latest/manual/cmake-presets.7.html) 与 [编译数据库](https://cmake.org/cmake/help/latest/variable/CMAKE_EXPORT_COMPILE_COMMANDS.html)
-17. [CMake FetchContent](https://cmake.org/cmake/help/latest/module/FetchContent.html) 与 [FindThreads](https://cmake.org/cmake/help/latest/module/FindThreads.html)
 18. [xmake 目标配置 API](https://xmake.io/api/description/project-target.html)
 19. [xmake 内置 policies](https://xmake.io/api/description/builtin-policies.html)
 20. [xmake 依赖与锁文件](https://xmake.io/guide/package-management/using-official-packages.html)

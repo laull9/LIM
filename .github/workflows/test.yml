@@ -1,0 +1,35 @@
+name: xmake tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [debug, release]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: '3.1.2'
+      - name: Install compiler and database dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-20 clang-tools-20 llvm-20 libc++-20-dev libc++abi-20-dev pkg-config libsqlite3-dev libpq-dev postgresql-16 libssl-dev
+      - name: Build and test
+        env:
+          LIM_PG_BINDIR: /usr/lib/postgresql/16/bin
+        run: |
+          xmake f -m ${{ matrix.mode }} --toolchain=clang --bin=/usr/lib/llvm-20/bin --runtimes=c++_shared -o build/xmake
+          xmake
+          xmake test --output-on-failure
