@@ -1,40 +1,56 @@
-# LIM · laull's 即时通讯服务器
+# LIM
 
-LIM 面向自托管即时通讯，以**默认端到端加密、低延迟投递**为核心，首版覆盖单聊、群聊、多设备和离线同步。
+LIM 是一个可嵌入的轻量聊天服务器。目标部署形态是一个 `lim-server` 进程和本机 SQLite 数据目录。C++ 应用也可以把同一套会话、发送、补齐接口链接进自己的进程。单聊、邀请制小群和 Agent Harness 共用一条按会话排序的事件日志。
 
-架构采用 C++ 单进程模块化服务、PostgreSQL 持久化、HTTP 控制接口与 WebSocket 实时通道。客户端负责 MLS 加密、解密和身份验证，服务端负责密文的可靠存储、排序和投递。
+普通聊天默认采用 MLS 端到端加密。需要读取上下文的 Agent 可以作为受邀的加密端点入群；受信宿主还可以显式创建宿主可读的会话，直接保存文本、JSON 或字节。会话建立后固定内容模式。
 
-## 当前进度
+## 当前可用
 
-已建立顶层设计。当前代码为 C++23 modules 启动示例，入口是 `src/main.cppm`，通过 `import ltool` 使用仓库内工具库；xmake 可执行目标名仍为 `my_app`，测试为 Catch2 算术示例。IM 业务、端到端加密客户端和延迟基准待实施。
+- C++23 静态库目标 `lim::core`。模块 `lim.chat` 导出身份、消息、回执、分页及同步调用接口；`lim.frame` 实现有界、借用输入的二进制拆帧。
+- 可单独执行的 SQLite 日志设计和约束测试。服务监听、C++ SQLite 适配器、凭据管理和 MLS 客户端仍在实施路线中。目前没有可运行的 IM 守护进程。
+- 源码集成使用 `add_subdirectory(path/to/LIM)` 和 `target_link_libraries(my_app PRIVATE lim::core)`，然后在 C++23 消费目标中 `import lim.chat;`。同一工具链从源码构建模块。
 
-## 设计入口
-
-| 文档 | 内容 |
+| 从哪里读 | 内容 |
 | --- | --- |
-| [系统架构](docs/architecture.md) | 产品范围、模块依赖、消息事务、线程与部署模型 |
-| [加密与信任](docs/security.md) | MLS、设备身份、入群退群、密钥恢复与元数据边界 |
-| [协议与数据契约](docs/protocol.md) | 帧格式、消息状态、幂等、epoch、同步游标和数据模型 |
-| [实施与验收](docs/roadmap.md) | 里程碑、双构建基线、故障测试和延迟测量 |
+| [系统架构](docs/architecture.md) | 嵌入与部署、宿主边界、SQLite 写入、内存预算 |
+| [协议](docs/protocol.md) | HTTP/WS、Agent 消息示例、幂等与补齐 |
+| [加密与信任](docs/security.md) | MLS、设备授权、宿主可读会话的信任边界 |
+| [实施与验收](docs/roadmap.md) | 发布切片、可重现的内存和延迟验收 |
+| [日志结构](design/sqlite/event_log.sql) | 可执行的 SQLite 事件与幂等约束草案 |
 
-首版设计约束：
+## Agent 侧的调用形状
 
-- 消息正文、群名称、已读回执在客户端加密；服务器持有投递所需的账号、设备和成员关系等元数据。
-- 消息成功确认发生在数据库事务持久化之后，同一会话按服务端序号排序，重试采用幂等键。
-- 在线消息提交后立即推送；重连依靠持久化事件流补齐，慢连接受队列上限约束。
-- 首轮验收目标：服务端处理 P99 ≤ 20 ms，受控网络下在线端到端 P99 ≤ 100 ms。负载、网络和计时口径见[延迟验收](docs/roadmap.md#延迟验收)。
+宿主为每次逻辑答复生成并持久化一个 UUID，和已经编码的字节一起保存。重试时取回两者。下面的函数可由宿主的写入线程调用；具体 Chat 适配器由宿主注入。
 
-## 开发入口
+```cpp
+#include <cstddef>
+#include <span>
+import lim.chat;
 
-现有 xmake 示例的操作入口如下；这些命令用于现有模板，本轮文档工作未执行构建：
-
-```sh
-xmake f -m debug -o build/xmake
-xmake build my_app
-xmake run my_app
-xmake test
+lim::Result<lim::Receipt> send_reply(lim::Chat& chat, const lim::Session& session,
+                                     lim::Id room, lim::Id message_id,
+                                     std::span<const std::byte> json) {
+    return chat.append(session, {room, message_id, lim::HostContent::Json, json});
+}
 ```
 
-现有入口要求支持 `import std` 的 C++23 编译器与标准库组合。仓库尚未记录经过验证的最低工具链版本，根目录 CMake 入口也待补齐。M0 将锁定编译器、标准库、CMake、Ninja、xmake 与依赖版本，落实配置隔离、告警、真实行为测试和双入口验证，再发布正式构建命令。具体工作见[实施路线](docs/roadmap.md)。
+## 构建与验证
 
-贡献规范见 [AGENTS.md](AGENTS.md)。
+CMake 入口要求 3.28+ 和 Ninja 1.11+。xmake 入口要求 3.0.6+。C++ 编译器与标准库需支持 named modules 和 `std::expected`。Linux x86-64 已验证 GCC/libstdc++ 14.2、CMake 3.31.6、Ninja 1.11.1 与 xmake 3.0.6；核心无需下载第三方包。使用 clang-format 19 的 LLVM 风格。
+
+```sh
+cmake --preset debug
+cmake --build build/cmake/Linux/debug
+ctest --test-dir build/cmake/Linux/debug --output-on-failure
+
+xmake f -m debug -o build/xmake
+xmake build lim_frame_test
+xmake test
+
+# 可选的存储设计验证，Python 3.11+ 与 SQLite 3.37+
+python3 design/sqlite/check_event_log.py
+```
+
+本次 Linux 验证中，ASan 拆帧测试通过（运行环境限制，关闭 leak 检查）。GCC 14.2 在启用 UBSan 编译模块接口时出现内部编译器错误，UBSan 验证待换工具链复测。
+
+Release 构建可选 `cmake --preset release` 并构建对应的 release 目录，或 `xmake f -m release -o build/xmake && xmake`。贡献规范见 [AGENTS.md](AGENTS.md)。

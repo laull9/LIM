@@ -1,43 +1,19 @@
--- 项目元数据
+set_xmakever("3.0.6")
 set_project("lim")
-set_version("0.0.1", { build = "%Y%m%d%H%M" })
-set_warnings("none")
-vcpkg_triplet = "x64-$(os)"
+set_version("0.1.0")
+add_rules("mode.debug", "mode.release")
 
-xmake_requires = {}
+target("lim_core")
+    set_kind("static")
+    set_languages("cxx23")
+    set_warnings("allextra")
+    add_files("src/core/chat.cppm", "src/protocol/frame.cppm", {public = true})
 
-test_requires = {
-    "catch2"
-}
-add_requires(xmake_requires)
-add_requires(test_requires)
-
--- 通用编译选项
-set_languages("c++23")
-
--- macOS 使用 PATH 中的 LLVM clang，避免项目配置到缺失的 Xcode SDK。
-if is_plat("macosx") and not get_config("toolchain") then
-    set_toolchains("clang")
-end
-
--- 生成compile_commands.json供clangd使用
-add_rules("plugin.compile_commands.autoupdate")
-
--- 主程序
-target("my_app")
+target("lim_frame_test")
     set_kind("binary")
-    add_files("src/*.cppm")
-    add_files("inc/ltool/modules/ltool.cppm")
-    add_headerfiles("inc/(**.h)")
-    add_includedirs("inc")
-    add_includedirs("inc/ltool")
-    add_includedirs("inc/ltool/pkgs/range-v3/include")
-    add_packages(xmake_requires)
-    set_policy("build.c++.modules", true)
-
-    -- 输出目录保持与原脚本一致
-    set_targetdir("$(builddir)/bin/$(os)/$(arch)")
-    set_objectdir("$(builddir)/obj/$(os)/$(arch)")
-
--- tests
-includes("tests")
+    set_default(false)
+    set_languages("cxx23")
+    set_warnings("allextra")
+    add_deps("lim_core")
+    add_files("tests/frame.cpp")
+    add_tests("frame")
