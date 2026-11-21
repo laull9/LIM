@@ -6,10 +6,12 @@ import styles from './Message.module.css'
 import { MessageBubble } from './MessageBubble'
 import { WaveLine } from './WaveDecor'
 import { useChat } from '../chat/chat-context'
-import type { Item } from '../chat/chat-context'
+import { formatDayDivider, sameCalendarDay } from '../chat/rich-message'
+import type { ProjectedMessage } from '../chat/rich-message'
 
 const START = 1_000_000_000
 const THRESHOLD = 66
+const GROUP_GAP_MS = 5 * 60_000
 
 interface ListContext {
   loading: boolean
@@ -55,7 +57,7 @@ function EmptyPlaceholder() {
       </svg>
       <h3 className="text-base font-extrabold">新的潮汐，从这里开始</h3>
       <p className="mt-1 max-w-xs text-sm leading-relaxed text-muted-foreground">
-        发送第一条消息。断网时它也会留在本机，联网后按原键继续投递。
+        发送文字、语音、照片、视频或文件。断网时消息也会留在本地，联网后自动投递。
       </p>
     </div>
   )
@@ -63,23 +65,32 @@ function EmptyPlaceholder() {
 
 const COMPONENTS = { Header: ListHeader, Footer: ListFooter, EmptyPlaceholder }
 
-const itemKey = (value?: Item) => {
-  if (!value) return undefined
-  if (!('device' in value)) return 'pending'
-  return value.account ? `a:${value.account}` : `d:${value.device}`
-}
-
 export function MessageList() {
   const {
-    items, prepended, canLoadOlder, olderBusy, loadOlderMessages, identity,
-    timelineReady, status,
+    projected, prepended, canLoadOlder, olderBusy, loadOlderMessages,
+    timelineReady, status, chatSearch,
   } = useChat()
   const virtuoso = useRef<VirtuosoHandle>(null)
   const [atBottom, setAtBottom] = useState(true)
+  const [flashSeq, setFlashSeq] = useState('')
+
+  const visibleMessages = useMemo(() => {
+    const q = chatSearch.trim().toLowerCase()
+    if (!q) return projected.messages
+    return projected.messages.filter((m) => !m.recalled && m.text.toLowerCase().includes(q))
+  }, [projected.messages, chatSearch])
 
   const load = useCallback(() => {
     if (!olderBusy) loadOlderMessages()
   }, [olderBusy, loadOlderMessages])
+
+  const jumpToSeq = useCallback((seq: string) => {
+    const idx = visibleMessages.findIndex((m) => m.seq === seq)
+    if (idx < 0) return
+    virtuoso.current?.scrollToIndex({ index: idx, align: 'center', behavior: 'smooth' })
+    setFlashSeq(seq)
+    window.setTimeout(() => setFlashSeq((current) => (current === seq ? '' : current)), 1600)
+  }, [visibleMessages])
 
   const context = useMemo<ListContext>(
     () => ({ loading: olderBusy, canLoadOlder, load }),
@@ -94,10 +105,10 @@ export function MessageList() {
         </div>
       )}
       {timelineReady ? (
-        <Virtuoso<Item, ListContext>
+        <Virtuoso<ProjectedMessage, ListContext>
           ref={virtuoso}
           className="absolute inset-0"
-          data={items}
+          data={visibleMessages}
           context={context}
           firstItemIndex={START - prepended}
           initialTopMostItemIndex={{ index: 'LAST', align: 'end' }}
@@ -106,17 +117,37 @@ export function MessageList() {
           atBottomThreshold={THRESHOLD}
           alignToBottom
           increaseViewportBy={{ top: 600, bottom: 300 }}
-          computeItemKey={(_index, item) => `${itemKey(item)}:${item.id}`}
+          computeItemKey={(_index, item) => `${item.pending ? 'p' : 's'}:${item.id}`}
           components={COMPONENTS}
-          itemContent={(index, item) => {
-            const position = index - (START - prepended)
-            const prev = items[position - 1]
-            const next = items[position + 1]
-            const key = itemKey(item)
-            const first = itemKey(prev) !== key
-            const last = itemKey(next) !== key
-            return <MessageBubble item={item} device={identity.device}
-              account={identity.account} first={first} last={last} />
+          itemContent={(index, msg) => {
+            const pos = index - (START - prepended)
+            const prev = visibleMessages[pos - 1]
+            const next = visibleMessages[pos + 1]
+            const showDay = !prev || !sameCalendarDay(prev.ts, msg.ts)
+            const samePrev = Boolean(
+              prev && !showDay && prev.senderId === msg.senderId && prev.kind !== 'system'
+              && !prev.recalled && (msg.ts - prev.ts) <= GROUP_GAP_MS,
+            )
+            const sameNext = Boolean(
+              next && sameCalendarDay(msg.ts, next.ts) && next.senderId === msg.senderId
+              && next.kind !== 'system' && !next.recalled && (next.ts - msg.ts) <= GROUP_GAP_MS,
+            )
+            return (
+              <>
+                {showDay && (
+                  <div className={styles.day}>
+                    <span className={styles.dayChip}>{formatDayDivider(msg.ts)}</span>
+                  </div>
+                )}
+                <MessageBubble
+                  msg={msg}
+                  first={!samePrev}
+                  last={!sameNext}
+                  highlighted={Boolean(msg.seq && msg.seq === flashSeq)}
+                  onJump={jumpToSeq}
+                />
+              </>
+            )
           }}
         />
       ) : (
@@ -126,7 +157,7 @@ export function MessageList() {
         </div>
       )}
 
-      {!atBottom && timelineReady && (
+      {!atBottom && timelineReady && visibleMessages.length > 0 && (
         <button
           className={styles.toBottom}
           onClick={() => virtuoso.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'smooth' })}

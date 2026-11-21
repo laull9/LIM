@@ -1,4 +1,7 @@
-import { ArrowRight, Cable, Eye, EyeOff, Loader2, LogIn, Monitor, Radio, TriangleAlert, X } from 'lucide-react'
+import {
+  ArrowRight, Bell, Bookmark, Cable, Download, Eye, EyeOff, Loader2, LogIn, Monitor, Radio,
+  TriangleAlert, UserPlus, X,
+} from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import { Button } from './components/ui/button'
@@ -12,6 +15,7 @@ import { Sidebar } from './components/Sidebar'
 import { WaveLine, WaveMark, WaveStack } from './components/WaveDecor'
 import { ChatProvider } from './chat/store'
 import { useChat } from './chat/chat-context'
+import { downloadMedia, useMediaUrl } from './chat/media'
 import {
   clearSavedAuth, identityFromAuth, loadSavedAuth, rotateAuth, saveAuth,
   stableDeviceId, browserDeviceName,
@@ -216,7 +220,7 @@ function Panel({ title, children, close }: { title: string; children: ReactNode;
 }
 
 function NewChatPanel({ close }: { close: () => void }) {
-  const { client, identity, refresh, openRoom } = useChat()
+  const { client, identity, contacts, refresh, openRoom, openSelfChat } = useChat()
   const [query, setQuery] = useState('')
   const [users, setUsers] = useState<Account[]>([])
   const [selected, setSelected] = useState<Account[]>([])
@@ -224,7 +228,7 @@ function NewChatPanel({ close }: { close: () => void }) {
   const [busy, setBusy] = useState(false)
   const [issue, setIssue] = useState('')
 
-  const visibleUsers = query.trim() ? users : []
+  const visibleUsers = query.trim() ? users : contacts
 
   useEffect(() => {
     if (query.trim().length < 1) return
@@ -274,13 +278,27 @@ function NewChatPanel({ close }: { close: () => void }) {
 
   return (
     <Panel title="发起聊天" close={close}>
-      <label htmlFor="people-search" className="text-xs font-bold">按用户名找人</label>
-      <Input id="people-search" value={query} autoFocus placeholder="输入用户名开头"
+      <button
+        type="button"
+        onClick={() => { void openSelfChat(); close() }}
+        className="mb-3 flex w-full items-center gap-3 rounded-2xl bg-muted px-3 py-2.5 text-left transition-colors hover:bg-accent"
+      >
+        <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-tide text-white">
+          <Bookmark size={16} />
+        </span>
+        <span className="min-w-0 flex-1">
+          <strong className="block text-sm">与自己对话（我的随手记）</strong>
+          <small className="block text-xs text-muted-foreground">私人笔记、语音、照片与文件多设备同步</small>
+        </span>
+        <ArrowRight size={15} className="text-muted-foreground" />
+      </button>
+      <label htmlFor="people-search" className="text-xs font-bold">按用户名或昵称找人</label>
+      <Input id="people-search" value={query} autoFocus placeholder="输入用户名或昵称搜索…"
         onChange={(event) => setQuery(event.target.value)} className="mt-1.5" />
       <div className="mt-3 max-h-56 overflow-y-auto rounded-xl border border-border">
         {visibleUsers.length === 0 ? (
           <p className="p-4 text-center text-xs text-muted-foreground">
-            {query.trim() ? '没有匹配的用户。' : '输入用户名以搜索账号。'}
+            {query.trim() ? '没有匹配的用户。' : '暂无联系人，输入用户名或昵称搜索账号。'}
           </p>
         ) : visibleUsers.map((user) => (
           <button key={user.account} type="button" onClick={() => toggle(user)}
@@ -419,9 +437,62 @@ function Workspace() {
   return null
 }
 
+function LightboxOverlay() {
+  const { client, identity, lightbox, setLightbox } = useChat()
+  const { url, loading } = useMediaUrl(lightbox?.roomId, lightbox?.mediaId)
+
+  useEffect(() => {
+    if (!lightbox) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setLightbox(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [lightbox, setLightbox])
+
+  if (!lightbox) return null
+  return (
+    <div
+      className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/80 p-6 backdrop-blur-sm"
+      onMouseDown={(event) => { if (event.target === event.currentTarget) setLightbox(null) }}
+    >
+      <div className="mb-3 flex w-full max-w-4xl items-center justify-between gap-3 text-white">
+        <span className="truncate text-sm font-bold">{lightbox.name || '媒体预览'}</span>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => void downloadMedia(
+              () => client.fetchMedia(identity.generation, lightbox.roomId, lightbox.mediaId, new AbortController().signal),
+              lightbox.name || 'media',
+            )}
+          >
+            <Download size={14} /> 下载
+          </Button>
+          <Button variant="ghost" size="icon" className="text-white hover:bg-white/15" onClick={() => setLightbox(null)} aria-label="关闭预览">
+            <X />
+          </Button>
+        </div>
+      </div>
+      <div className="flex max-h-[82dvh] max-w-[92vw] items-center justify-center">
+        {!url ? (
+          <div className="inline-flex items-center gap-2 text-sm font-bold text-white/80">
+            <Loader2 size={16} className="animate-spin" /> {loading ? '正在加载媒体…' : '无法加载媒体'}
+          </div>
+        ) : lightbox.kind === 'image' ? (
+          <img src={url} alt={lightbox.name} className="max-h-[82dvh] max-w-[92vw] rounded-2xl object-contain shadow-2xl" />
+        ) : (
+          <video src={url} controls autoPlay playsInline className="max-h-[82dvh] max-w-[92vw] rounded-2xl bg-black shadow-2xl" />
+        )}
+      </div>
+    </div>
+  )
+}
+
 /* ───────────────── 工作区 ───────────────── */
 
 function EmptyRoom() {
+  const { openSelfChat, openSystemChat, setWorkspace } = useChat()
   return (
     <div className={styles.empty}>
       <svg viewBox="0 0 160 80" className={styles.emptyWaves} aria-hidden="true">
@@ -429,13 +500,24 @@ function EmptyRoom() {
         <path d="M0 58c13-14 27-14 40 0s27 14 40 0 27-14 40 0 27 14 40 0" fill="none" stroke="var(--coral)" strokeWidth="3" strokeLinecap="round" opacity=".75" />
       </svg>
       <h2>选择一段对话</h2>
-      <p>从左侧选一段已缓存的会话，或点右上角的人形按钮找人聊天。断网时仍可阅读本地历史。</p>
+      <p>你可以立即打开「系统消息」或「与自己对话」，也可以搜索用户名添加联系人并发起私聊或小群。</p>
+      <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
+        <Button variant="default" onClick={() => void openSelfChat()}>
+          <Bookmark size={15} /> 与自己对话
+        </Button>
+        <Button variant="secondary" onClick={openSystemChat}>
+          <Bell size={15} /> 查看系统消息
+        </Button>
+        <Button variant="secondary" onClick={() => setWorkspace('new')}>
+          <UserPlus size={15} /> 找人聊天
+        </Button>
+      </div>
     </div>
   )
 }
 
 function Shell() {
-  const { active, status, issue, infoOpen, retry, workspace } = useChat()
+  const { active, status, issue, infoOpen, retry, workspace, lightbox } = useChat()
 
   return (
     <div className={styles.app} data-room-open={Boolean(active)}>
@@ -471,6 +553,7 @@ function Shell() {
 
       {active && infoOpen && <InfoPanel />}
       {workspace !== 'none' && <Workspace />}
+      {lightbox && <LightboxOverlay />}
     </div>
   )
 }

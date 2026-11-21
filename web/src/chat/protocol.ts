@@ -17,7 +17,7 @@ const conversation = z.object({
   after: sequence,
   last_seq: sequence,
   profile: z.literal('host'),
-  kind: z.enum(['direct', 'group']).optional(),
+  kind: z.enum(['direct', 'group', 'self', 'system']).optional(),
   title: z.string().optional(),
   members: z.array(account).optional(),
 }).refine(({ after, last_seq }) => BigInt(after) <= BigInt(last_seq))
@@ -53,6 +53,18 @@ const device = z.object({
   last_seen: z.number().int().nonnegative(),
   revoked: z.boolean(),
 })
+const mediaMeta = z.object({
+  media_id: uuid,
+  conversation_id: uuid,
+  mime_type: z.string(),
+  filename: z.string(),
+  size: z.number().int().nonnegative(),
+})
+const mediaInit = z.object({
+  media_id: uuid,
+  chunk_size: z.number().int().positive(),
+  max_bytes: z.number().int().positive(),
+})
 const errorDetail = z.object({
   code: z.number().int(),
   message: z.string(),
@@ -76,6 +88,8 @@ export type WireEvent = z.infer<typeof event>
 export type Account = z.infer<typeof account>
 export type Device = z.infer<typeof device>
 export type AuthResult = z.infer<typeof authResult>
+export type MediaMeta = z.infer<typeof mediaMeta>
+export type SendContentType = 'text/plain' | 'application/json'
 export type AccountCredentials = {
   username: string
   password: string
@@ -84,14 +98,17 @@ export type AccountCredentials = {
 }
 export type RegisterCredentials = AccountCredentials & { display_name: string }
 
+export const MAX_MEDIA_BYTES = 20 * 1024 * 1024
+const SINGLE_UPLOAD_MAX_BYTES = 384 * 1024
+
 const errors: Record<string, string> = {
   unauthenticated: '登录状态或设备令牌无效，请重新登录。',
   device_revoked: '此设备已被撤销。',
   username_taken: '这个用户名已被使用，请换一个。',
-  not_found_or_forbidden: '此会话已不存在或设备已失去访问权限。',
+  not_found_or_forbidden: '此会话已不存在或无权操作。',
   recovery_required: '服务已切换恢复代次。请重新连接设备。',
   cursor_expired: '部分历史消息已过期。',
-  payload_too_large: '消息超过 64 KiB。',
+  payload_too_large: '内容超过允许的体积上限。',
   idempotency_expired: '这条消息的原始发送记录已过期。',
   idempotency_conflict: '此消息与服务端已有的发送记录冲突。',
   overloaded: '服务繁忙，正在重试。',
@@ -140,7 +157,7 @@ export function delay(milliseconds: number, signal: AbortSignal) {
   })
 }
 
-async function request(path: string, token: string | undefined, options: RequestInit, signal: AbortSignal) {
+async function request(path: string, token: string | undefined, options: RequestInit, signal: AbortSignal, timeoutMs = 15_000) {
   const headers = new Headers(options.headers)
   if (token) headers.set('Authorization', `Bearer ${token}`)
   let response: Response
@@ -149,7 +166,7 @@ async function request(path: string, token: string | undefined, options: Request
       ...options,
       cache: 'no-store',
       headers,
-      signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
     })
   } catch (error) {
     if (signal.aborted) throw error
@@ -157,10 +174,11 @@ async function request(path: string, token: string | undefined, options: Request
   }
   if (response.ok) return response
   if (response.status === 401) throw new LimError('unauthenticated')
+  if (response.status === 413) throw new LimError('payload_too_large')
   if (response.status === 429 || response.status === 503) throw new LimError('overloaded', true)
   if (response.status >= 500) throw new LimError('temporarily_unavailable', true)
   const body = z.object({ code: z.string(), sequence: sequence.optional() })
-    .safeParse(await json(response))
+    .safeParse(await json(response).catch(() => null))
   if (!body.success) throw new LimError('invalid_response')
   throw new LimError(body.data.code, false, body.data.sequence)
 }
@@ -237,14 +255,14 @@ export class LimClient {
     this.#token = token
   }
 
-  async #request(path: string, options: RequestInit, signal: AbortSignal) {
+  async #request(path: string, options: RequestInit, signal: AbortSignal, timeoutMs = 15_000) {
     try {
-      return await request(path, this.#token, options, signal)
+      return await request(path, this.#token, options, signal, timeoutMs)
     } catch (error) {
       if (!this.#refresh || !(error instanceof LimError) || error.kind !== 'unauthenticated') throw error
       const token = await this.#refresh(signal)
       this.#token = token
-      return await request(path, token, options, signal)
+      return await request(path, token, options, signal, timeoutMs)
     }
   }
 
@@ -264,6 +282,18 @@ export class LimClient {
 
   searchAccounts(generation: string, query: string, signal: AbortSignal) {
     return this.rpc('account.search', { generation, query }, z.object({ users: z.array(account) }), signal)
+  }
+
+  listContacts(generation: string, signal: AbortSignal) {
+    return this.rpc('contact.list', { generation }, z.object({ contacts: z.array(account) }), signal)
+  }
+
+  addContact(generation: string, account_id: string, signal: AbortSignal) {
+    return this.rpc('contact.add', { generation, account_id }, z.object({ contact: account }), signal)
+  }
+
+  removeContact(generation: string, account_id: string, signal: AbortSignal) {
+    return this.rpc('contact.remove', { generation, account_id }, z.object({ ok: z.literal(true) }), signal)
   }
 
   startConversation(generation: string, account_ids: string[], title: string | undefined, signal: AbortSignal) {
@@ -323,14 +353,94 @@ export class LimClient {
     return true
   }
 
-  send(generation: string, room: string, id: string, text: string, signal: AbortSignal) {
+  send(
+    generation: string,
+    room: string,
+    id: string,
+    text: string,
+    signal: AbortSignal,
+    content_type: SendContentType = 'text/plain',
+  ) {
     return this.rpc('message.send', {
       generation,
       conversation_id: room,
       client_message_id: id,
-      content_type: 'text/plain',
+      content_type,
       text,
     }, receipt, signal)
+  }
+
+  async uploadMedia(
+    generation: string,
+    room: string,
+    blob: Blob,
+    filename: string,
+    mimeType: string,
+    signal: AbortSignal,
+    onProgress?: (percent: number) => void,
+  ): Promise<MediaMeta> {
+    if (blob.size === 0) throw new LimError('invalid_argument')
+    if (blob.size > MAX_MEDIA_BYTES) throw new LimError('payload_too_large')
+    const safeMime = mimeType || blob.type || 'application/octet-stream'
+
+    if (blob.size <= SINGLE_UPLOAD_MAX_BYTES) {
+      onProgress?.(20)
+      const response = await this.#request(`/v1/conversations/${room}/media`, {
+        method: 'POST',
+        headers: {
+          'LIM-Generation': generation,
+          'Content-Type': safeMime,
+          'X-LIM-Filename': encodeURIComponent(filename),
+        },
+        body: blob,
+      }, signal, 30_000)
+      onProgress?.(100)
+      return parse(mediaMeta, await json(response))
+    }
+
+    const initResp = await this.#request(`/v1/conversations/${room}/media-uploads`, {
+      method: 'POST',
+      headers: {
+        'LIM-Generation': generation,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ mime_type: safeMime, filename }),
+    }, signal)
+    const session = parse(mediaInit, await json(initResp))
+    const chunkSize = Math.min(session.chunk_size, SINGLE_UPLOAD_MAX_BYTES)
+    const totalChunks = Math.ceil(blob.size / chunkSize)
+    for (let index = 0; index < totalChunks; index += 1) {
+      signal.throwIfAborted()
+      const start = index * chunkSize
+      const chunk = blob.slice(start, Math.min(blob.size, start + chunkSize))
+      await this.#request(`/v1/conversations/${room}/media-uploads/${session.media_id}/chunks/${index}`, {
+        method: 'PUT',
+        headers: {
+          'LIM-Generation': generation,
+          'Content-Type': 'application/octet-stream',
+        },
+        body: chunk,
+      }, signal, 30_000)
+      onProgress?.(Math.min(95, Math.round(((index + 1) / totalChunks) * 95)))
+    }
+    const doneResp = await this.#request(`/v1/conversations/${room}/media-uploads/${session.media_id}/complete`, {
+      method: 'POST',
+      headers: {
+        'LIM-Generation': generation,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ chunks: totalChunks }),
+    }, signal)
+    onProgress?.(100)
+    return parse(mediaMeta, await json(doneResp))
+  }
+
+  async fetchMedia(generation: string, room: string, mediaId: string, signal: AbortSignal): Promise<Blob> {
+    const response = await this.#request(`/v1/conversations/${room}/media/${mediaId}`, {
+      method: 'GET',
+      headers: { 'LIM-Generation': generation },
+    }, signal, 60_000)
+    return await response.blob()
   }
 }
 

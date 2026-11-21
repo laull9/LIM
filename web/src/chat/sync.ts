@@ -100,7 +100,14 @@ export async function deliver(
   while (!signal.aborted) {
     let receipt
     try {
-      receipt = await client.send(identity.generation, conversation.conversation_id, message.id, message.text, signal)
+      receipt = await client.send(
+        identity.generation,
+        conversation.conversation_id,
+        message.id,
+        message.text,
+        signal,
+        message.contentType ?? 'text/plain',
+      )
     } catch (error) {
       if (signal.aborted) return
       if (sessionEnded(error) || (error instanceof LimError && error.kind === 'not_found_or_forbidden')) {

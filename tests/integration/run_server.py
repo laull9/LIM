@@ -48,6 +48,10 @@ def running_server(test, config, env):
                 process.terminate()
                 exit_code = process.wait(timeout=10)
                 assert exit_code == 0, f"lim-server exited with {exit_code}"
+                output.seek(0)
+                stderr_text = output.read()
+                assert "Bad file descriptor" not in stderr_text, stderr_text
+                assert "read http header error" not in stderr_text, stderr_text
             except BaseException:
                 output.seek(0)
                 print(output.read(), flush=True)
@@ -234,6 +238,26 @@ def verify_accounts(client, port):
     })
     assert alice["username"] == "alice" and alice["device"] == device_a, alice
     client.tokens["alice_account"] = alice["access_token"]
+    initial_rooms = success(client, "conversation.list", {"generation": GENERATION}, "alice_account")
+    rooms_by_kind = {item["kind"]: item for item in initial_rooms["conversations"]}
+    assert set(rooms_by_kind) == {"self", "system"}, initial_rooms
+    self_room = rooms_by_kind["self"]["conversation_id"]
+    system_room = rooms_by_kind["system"]["conversation_id"]
+    assert rooms_by_kind["system"]["last_seq"] == "1", rooms_by_kind["system"]
+    assert rooms_by_kind["self"]["last_seq"] == "1", rooms_by_kind["self"]
+    error(client.rpc(call("message.send", {
+        "generation": GENERATION, "conversation_id": system_room,
+        "client_message_id": uid(1099), "content_type": "text/plain", "text": "forbidden",
+    }), "alice_account"), -32004, "not_found_or_forbidden")
+    self_sent = success(client, "message.send", {
+        "generation": GENERATION, "conversation_id": self_room,
+        "client_message_id": uid(1098), "content_type": "text/plain", "text": "写给自己",
+    }, "alice_account")
+    assert self_sent == {"seq": "2", "replayed": False}, self_sent
+    self_again = success(client, "conversation.start", {
+        "generation": GENERATION, "account_ids": [alice["account"]],
+    }, "alice_account")
+    assert self_again["conversation_id"] == self_room and self_again["kind"] == "self", self_again
     error(client.rpc(call("account.register", {
         "username": "alice", "display_name": "冒名者", "device_id": uid(1005),
         "device_name": "Other", "password": password,
@@ -293,7 +317,88 @@ def verify_accounts(client, port):
     assert login_a2["device"] == device_a2 and login_a2["account"] == alice["account"]
     client.tokens["alice_second"] = login_a2["access_token"]
     listing = success(client, "conversation.list", {"generation": GENERATION}, "alice_second")
-    assert [item["conversation_id"] for item in listing["conversations"]] == [direct], listing
+    assert {item["conversation_id"] for item in listing["conversations"]} == {
+        direct, self_room, system_room,
+    }, listing
+    sys_events = success(client, "conversation.events", {
+        "generation": GENERATION, "conversation_id": system_room, "after": "0",
+    }, "alice_second")
+    assert len(sys_events["events"]) >= 2, sys_events
+    self_events = success(client, "conversation.events", {
+        "generation": GENERATION, "conversation_id": self_room, "after": "0",
+    }, "alice_second")
+    assert base64.b64decode(self_events["events"][-1]["payload_base64"]) == "写给自己".encode()
+
+    # Contacts: direct chat auto-adds bob; charlie can be added and removed explicitly.
+    contacts = success(client, "contact.list", {"generation": GENERATION}, "alice_account")
+    assert {item["username"] for item in contacts["contacts"]} == {"bob"}, contacts
+    added = success(client, "contact.add", {
+        "generation": GENERATION, "account_id": third["account"],
+    }, "alice_account")
+    assert added["contact"]["username"] == "charlie", added
+    contacts = success(client, "contact.list", {"generation": GENERATION}, "alice_account")
+    assert {item["username"] for item in contacts["contacts"]} == {"bob", "charlie"}, contacts
+    success(client, "contact.remove", {
+        "generation": GENERATION, "account_id": third["account"],
+    }, "alice_account")
+    contacts = success(client, "contact.list", {"generation": GENERATION}, "alice_account")
+    assert {item["username"] for item in contacts["contacts"]} == {"bob"}, contacts
+
+    # Media upload (single + chunked) and authorized Range download.
+    alice_headers = {"Authorization": f"Bearer {alice['access_token']}",
+                     "LIM-Generation": GENERATION}
+    bob_headers = {"Authorization": f"Bearer {bob['access_token']}",
+                   "LIM-Generation": GENERATION}
+    charlie_headers = {"Authorization": f"Bearer {third['access_token']}",
+                       "LIM-Generation": GENERATION}
+    status, body = client.request(
+        "POST", f"/v1/conversations/{direct}/media", b"hello-image-bytes",
+        {**alice_headers, "Content-Type": "image/png", "X-LIM-Filename": "wave.png"})
+    assert status == 200, (status, body)
+    uploaded = json.loads(body)
+    assert uploaded["size"] == len(b"hello-image-bytes") and uploaded["filename"] == "wave.png"
+    status, raw = client.request(
+        "GET", f"/v1/conversations/{direct}/media/{uploaded['media_id']}", headers=bob_headers)
+    assert status == 200 and raw == b"hello-image-bytes", (status, raw)
+    status, partial = client.request(
+        "GET", f"/v1/conversations/{direct}/media/{uploaded['media_id']}",
+        headers={**bob_headers, "Range": "bytes=0-4"})
+    assert status == 206 and partial == b"hello", (status, partial)
+    assert client.request(
+        "GET", f"/v1/conversations/{direct}/media/{uploaded['media_id']}",
+        headers=charlie_headers)[0] == 404
+
+    status, init_body = client.request(
+        "POST", f"/v1/conversations/{direct}/media-uploads",
+        json.dumps({"mime_type": "video/mp4", "filename": "clip.mp4"}).encode(),
+        {**alice_headers, "Content-Type": "application/json"})
+    assert status == 200, (status, init_body)
+    upload_id = json.loads(init_body)["media_id"]
+    part0, part1 = b"A" * 1024, b"B" * 512
+    assert client.request(
+        "PUT", f"/v1/conversations/{direct}/media-uploads/{upload_id}/chunks/0",
+        part0, {**alice_headers, "Content-Type": "application/octet-stream"})[0] == 200
+    assert client.request(
+        "PUT", f"/v1/conversations/{direct}/media-uploads/{upload_id}/chunks/1",
+        part1, {**alice_headers, "Content-Type": "application/octet-stream"})[0] == 200
+    status, done_body = client.request(
+        "POST", f"/v1/conversations/{direct}/media-uploads/{upload_id}/complete",
+        json.dumps({"chunks": 2}).encode(),
+        {**alice_headers, "Content-Type": "application/json"})
+    assert status == 200 and json.loads(done_body)["size"] == len(part0) + len(part1), (status, done_body)
+    status, combined = client.request(
+        "GET", f"/v1/conversations/{direct}/media/{upload_id}", headers=bob_headers)
+    assert status == 200 and combined == part0 + part1, (status, len(combined))
+
+    # Regression check: Connection: close must not emit Bad file descriptor warnings.
+    short_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        short_conn.request("GET", "/health/live", headers={"Connection": "close"})
+        reply = short_conn.getresponse()
+        assert reply.status == 200
+        reply.read()
+    finally:
+        short_conn.close()
     history = success(client, "conversation.events", {
         "generation": GENERATION, "conversation_id": direct, "after": "0",
     }, "alice_second")

@@ -1,4 +1,4 @@
-import { LogOut, MessageSquare, Monitor, Moon, RefreshCw, Sun } from 'lucide-react'
+import { Bookmark, LogOut, MessageSquare, Monitor, Moon, RefreshCw, Settings, Sun, Users } from 'lucide-react'
 import styles from './Rail.module.css'
 import { WaveMark } from './WaveDecor'
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip'
@@ -7,17 +7,21 @@ import {
   DropdownMenuSeparator, DropdownMenuTrigger,
 } from './ui/dropdown-menu'
 import { useChat } from '../chat/chat-context'
+import type { NavKey } from '../chat/chat-context'
 import { useTheme } from '../theme'
-import { accountLabel } from '../chat/naming'
+import { accountLabel, avatarInitials } from '../chat/naming'
 
-const NAV = [
-  { key: 'rooms', label: '会话', icon: MessageSquare },
-  { key: 'refresh', label: '刷新目录', icon: RefreshCw },
-] as const
+const NAV: { key: NavKey; label: string; icon: typeof MessageSquare }[] = [
+  { key: 'chats', label: '会话', icon: MessageSquare },
+  { key: 'contacts', label: '联系人', icon: Users },
+  { key: 'settings', label: '设置', icon: Settings },
+]
 
-/** 左侧潮汐导轨：品牌、视图、外观与账号菜单。 */
+/** 左侧潮汐导轨：品牌、视图切换、外观与账号菜单。 */
 export function Rail() {
-  const { identity, rooms, refresh, status, setWorkspace, logout } = useChat()
+  const {
+    identity, rooms, contacts, nav, setNav, refresh, status, setWorkspace, openSelfChat, logout,
+  } = useChat()
   const { theme, toggle } = useTheme()
 
   return (
@@ -37,20 +41,21 @@ export function Rail() {
 
       <nav className={styles.nav}>
         {NAV.map(({ key, label, icon: Icon }) => {
-          const active = key === 'rooms'
+          const active = nav === key
+          const count = key === 'chats' ? rooms.length : key === 'contacts' ? contacts.length : 0
           return (
             <Tooltip key={key}>
               <TooltipTrigger asChild>
                 <button
                   className={styles.navBtn}
                   data-active={active}
-                  aria-label={active ? `${label}，共 ${rooms.length} 个` : label}
+                  aria-label={count > 0 ? `${label}，共 ${count} 项` : label}
                   aria-current={active ? 'page' : undefined}
-                  onClick={key === 'refresh' ? refresh : undefined}
+                  onClick={() => setNav(key)}
                 >
                   <Icon size={21} strokeWidth={2.1} aria-hidden="true" />
-                  {key === 'rooms' && rooms.length > 0 && (
-                    <span className={styles.count}>{rooms.length > 99 ? '99+' : rooms.length}</span>
+                  {count > 0 && (
+                    <span className={styles.count}>{count > 99 ? '99+' : count}</span>
                   )}
                 </button>
               </TooltipTrigger>
@@ -74,14 +79,17 @@ export function Rail() {
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button className={styles.avatarBtn} aria-label="账号与设备">
-              {(identity.display_name || identity.device).slice(0, 1).toUpperCase()}
+              {avatarInitials(identity.display_name || identity.username || identity.device)}
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent side="right" align="end" className="w-60">
             <DropdownMenuLabel className="normal-case tracking-normal text-foreground">
               <span className="block truncate text-sm font-extrabold">{accountLabel(identity)}</span>
+              {identity.username && (
+                <span className="block truncate text-xs font-semibold text-muted-foreground">@{identity.username}</span>
+              )}
               <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground" title={identity.device}>
-                {identity.device}
+                设备 {identity.device.slice(0, 12)}…
               </span>
             </DropdownMenuLabel>
             <DropdownMenuSeparator />
@@ -89,17 +97,17 @@ export function Rail() {
               <span className={`size-2 rounded-full ${status.state === 'online' ? 'bg-kelp' : 'bg-amber'}`} />
               {status.state === 'online' ? '已连接' : status.state === 'blocked' ? '同步暂停' : '使用本地缓存'}
             </DropdownMenuItem>
-            <DropdownMenuItem disabled>
-              <span className="size-2 rounded-full bg-tide" />
-              {rooms.length} 个可用会话
-            </DropdownMenuItem>
             <DropdownMenuSeparator />
+            <DropdownMenuItem onSelect={() => void openSelfChat()}>
+              <Bookmark /> 与自己对话
+            </DropdownMenuItem>
             <DropdownMenuItem onSelect={refresh}>
               <RefreshCw /> 刷新会话目录
             </DropdownMenuItem>
             <DropdownMenuItem onSelect={() => setWorkspace('devices')}>
               <Monitor /> 账号与设备
             </DropdownMenuItem>
+            <DropdownMenuSeparator />
             <DropdownMenuItem danger onSelect={() => void logout()}>
               <LogOut /> 退出登录
             </DropdownMenuItem>

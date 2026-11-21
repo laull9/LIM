@@ -1,7 +1,8 @@
 import Dexie from 'dexie'
 import type { EntityTable, Table } from 'dexie'
 import { decodeBody } from './protocol'
-import type { Conversation, Identity, WireEvent } from './protocol'
+import type { Conversation, Identity, SendContentType, WireEvent } from './protocol'
+import { summarizeContent } from './rich-message'
 
 export interface SavedMessage {
   room: string
@@ -29,6 +30,7 @@ export interface PendingMessage {
   id: string
   room: string
   text: string
+  contentType?: SendContentType
   queuedAt: number
   status: 'queued' | 'accepted' | 'failed'
   acceptedSeq?: string
@@ -145,6 +147,21 @@ export function readTimeline(room: string) {
   })
 }
 
+export async function readRoomPreviews(scope: string): Promise<Record<string, string>> {
+  const prefix = `${scope}/`
+  const rows = await db.messages.where('[room+order]')
+    .between([prefix, Dexie.minKey], [`${prefix}\uffff`, Dexie.maxKey], true, true)
+    .toArray()
+  const previews: Record<string, string> = {}
+  for (const row of rows) {
+    const summary = summarizeContent(row.type, row.text)
+    if (!summary) continue
+    const conversationId = row.room.slice(prefix.length)
+    previews[conversationId] = summary
+  }
+  return previews
+}
+
 export function readAllQueued(scope: string) {
   const prefix = `${scope}/`
   return db.outbox.filter((item) => item.room.startsWith(prefix)).toArray()
@@ -189,8 +206,15 @@ export function saveEvents(
   })
 }
 
-export async function enqueue(room: string, text: string) {
-  await db.outbox.add({ id: crypto.randomUUID(), room, text, queuedAt: Date.now(), status: 'queued' })
+export async function enqueue(room: string, text: string, contentType: SendContentType = 'text/plain') {
+  await db.outbox.add({
+    id: crypto.randomUUID(),
+    room,
+    text,
+    contentType,
+    queuedAt: Date.now(),
+    status: 'queued',
+  })
 }
 
 export function acknowledge(room: string, id: string, seq: string) {
@@ -215,6 +239,7 @@ export async function retryPending(id: string) {
     id: item.id,
     room: item.room,
     text: item.text,
+    contentType: item.contentType ?? 'text/plain',
     queuedAt: item.queuedAt,
     status: 'queued',
   })

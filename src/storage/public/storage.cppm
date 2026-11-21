@@ -26,6 +26,24 @@ struct PostgresOptions {
 using StorageOptions = std::variant<SqliteOptions, PostgresOptions>;
 using SecretDigest = std::array<std::byte, 32>;
 
+inline constexpr std::size_t kMediaMaxBytes = 20 * 1024 * 1024;
+inline constexpr std::size_t kMediaChunkBytes = 384 * 1024;
+inline constexpr std::size_t kMediaMaxChunkBytes = 512 * 1024;
+
+struct MediaMeta {
+    Id id;
+    Id conversation;
+    std::string mime_type;
+    std::string filename;
+    Sequence size_bytes;
+    Sequence created_at;
+};
+
+struct StoredMedia {
+    MediaMeta meta;
+    std::vector<std::byte> content;
+};
+
 enum class StorageOpenError {
     InvalidConfiguration,
     ConnectionFailed,
@@ -87,6 +105,11 @@ struct ConversationPage {
     std::optional<Id> next_after;
 };
 
+struct DefaultRooms {
+    ConversationSummary self_room;
+    ConversationSummary system_room;
+};
+
 // Host administration is trusted. Session.credential is an opaque credential ID
 // supplied by an authenticated adapter. It is never an access token or password.
 class Store : public Chat {
@@ -125,6 +148,33 @@ class Store : public Chat {
                        std::string_view direct_key) = 0;
     [[nodiscard]] virtual Result<std::vector<DeviceSummary>> list_devices(const Session& session) = 0;
     [[nodiscard]] virtual Result<void> remove_device(const Session& session, Id device) = 0;
+    [[nodiscard]] virtual Result<DefaultRooms>
+    ensure_default_conversations(Id account, Id self_conversation, Id system_conversation,
+                                 Id system_event_key, Id self_event_key,
+                                 std::string_view welcome_json,
+                                 std::string_view self_welcome_json) = 0;
+    [[nodiscard]] virtual Result<void> append_system_notice(Id account, Id client_message_id,
+                                                            std::string_view json_payload) = 0;
+    [[nodiscard]] virtual Result<std::vector<AccountProfile>>
+    list_contacts(const Session& session) = 0;
+    [[nodiscard]] virtual Result<AccountProfile>
+    add_contact(const Session& session, Id target, Sequence now) = 0;
+    [[nodiscard]] virtual Result<void> remove_contact(const Session& session, Id target) = 0;
+    [[nodiscard]] virtual Result<MediaMeta>
+    put_media_single(const Session& session, Id conversation, Id media_id,
+                     std::string_view mime_type, std::string_view filename,
+                     std::span<const std::byte> data, Sequence now) = 0;
+    [[nodiscard]] virtual Result<void>
+    create_media_upload(const Session& session, Id conversation, Id media_id,
+                        std::string_view mime_type, std::string_view filename, Sequence now) = 0;
+    [[nodiscard]] virtual Result<void>
+    put_media_chunk(const Session& session, Id conversation, Id media_id, Sequence chunk_index,
+                    std::span<const std::byte> data) = 0;
+    [[nodiscard]] virtual Result<MediaMeta>
+    complete_media_upload(const Session& session, Id conversation, Id media_id,
+                          Sequence expected_chunks) = 0;
+    [[nodiscard]] virtual Result<StoredMedia>
+    get_media(const Session& session, Id conversation, Id media_id) = 0;
 };
 
 // Opens a file or a dedicated PostgreSQL database. Initializes an empty store with

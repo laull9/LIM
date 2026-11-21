@@ -23,12 +23,43 @@ namespace {
 
 using namespace storage_detail;
 
-constexpr Sequence kSchemaVersion = 2;
+constexpr Sequence kSchemaVersion = 3;
 constexpr Sequence kText = 0;
 constexpr Sequence kJson = 1;
 constexpr Sequence kBinary = 2;
+constexpr Sequence kMaxMediaChunks = 64;
+
+constexpr Id make_id(std::array<unsigned char, 16> raw) {
+    Id id{};
+    for (std::size_t i = 0; i < raw.size(); ++i) {
+        id.bytes[i] = static_cast<std::byte>(raw[i]);
+    }
+    return id;
+}
+
+inline constexpr Id kSystemAccount =
+    make_id({0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+             0x00, 0x01});
+inline constexpr Id kSystemDevice =
+    make_id({0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+             0x00, 0x02});
+inline constexpr Id kSystemCredential =
+    make_id({0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+             0x00, 0x03});
 
 static_assert(kMessageBytes == 65536);
+
+std::string hex_id(const Id& id) {
+    constexpr std::string_view kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(32);
+    for (const auto byte : id.bytes) {
+        const auto value = std::to_integer<unsigned int>(byte);
+        out.push_back(kHex[value >> 4]);
+        out.push_back(kHex[value & 0xf]);
+    }
+    return out;
+}
 
 std::unexpected<Failure> fail(Error code, std::optional<Sequence> sequence = std::nullopt) {
     return std::unexpected(Failure{code, sequence});
@@ -123,30 +154,56 @@ class Transaction {
 };
 
 std::expected<void, StorageOpenError> initialize(Database& db, Id generation) {
-    Transaction transaction(db, TransactionMode::Migration);
-    if (db.is_postgres()) {
-        db.exec("SELECT pg_advisory_xact_lock(1279872257)");
-    }
-    apply_schema(db, kMetadataSchema);
-    auto rows = db.query("SELECT version, generation FROM lim_metadata WHERE singleton = 1", {});
-    if (rows->next()) {
-        const auto version = rows->integer(0);
-        if (decode_id(rows->bytes(1)) != generation) {
-            return std::unexpected(StorageOpenError::GenerationMismatch);
+    Sequence existing_version = 0;
+    {
+        Transaction transaction(db, TransactionMode::Migration);
+        if (db.is_postgres()) {
+            db.exec("SELECT pg_advisory_xact_lock(1279872257)");
         }
-        if (version == 1) {
+        apply_schema(db, kMetadataSchema);
+        auto rows = db.query("SELECT version, generation FROM lim_metadata WHERE singleton = 1", {});
+        if (rows->next()) {
+            existing_version = rows->integer(0);
+            if (decode_id(rows->bytes(1)) != generation) {
+                return std::unexpected(StorageOpenError::GenerationMismatch);
+            }
+            if (existing_version == 1) {
+                rows.reset();
+                apply_schema(db, kMigrationV2);
+                existing_version = 2;
+            }
+            if (existing_version == 2 && db.is_postgres()) {
+                rows.reset();
+                apply_schema(db, kMigrationV3Postgres);
+                existing_version = 3;
+            } else if (existing_version != 2 && existing_version != kSchemaVersion) {
+                return std::unexpected(StorageOpenError::UnsupportedSchema);
+            }
+        } else {
             rows.reset();
-            apply_schema(db, kMigrationV2);
-        } else if (version != kSchemaVersion) {
-            return std::unexpected(StorageOpenError::UnsupportedSchema);
+            apply_schema(db, kSchemaV3);
+            db.exec("INSERT INTO lim_metadata(singleton, version, generation) VALUES (1, $1, $2)",
+                    {kSchemaVersion, blob(generation)});
+            existing_version = kSchemaVersion;
         }
-    } else {
-        rows.reset();
-        apply_schema(db, kSchemaV2);
-        db.exec("INSERT INTO lim_metadata(singleton, version, generation) VALUES (1, $1, $2)",
-                {kSchemaVersion, blob(generation)});
+        transaction.commit();
     }
-    transaction.commit();
+    if (existing_version == 2 && !db.is_postgres()) {
+        struct ForeignKeysGuard {
+            Database& database;
+            ~ForeignKeysGuard() {
+                try {
+                    database.script("PRAGMA foreign_keys=ON");
+                } catch (...) {
+                }
+            }
+        };
+        db.script("PRAGMA foreign_keys=OFF");
+        const ForeignKeysGuard restore{db};
+        Transaction transaction(db, TransactionMode::Migration);
+        apply_schema(db, kMigrationV3Sqlite);
+        transaction.commit();
+    }
     return {};
 }
 
@@ -154,6 +211,7 @@ struct Room {
     Sequence last_seq;
     Sequence retained_after;
     Sequence joined_after;
+    std::string kind;
 };
 
 class SqlStore final : public Store {
@@ -197,6 +255,27 @@ class SqlStore final : public Store {
                                                    std::string_view direct_key) override;
     Result<std::vector<DeviceSummary>> list_devices(const Session& session) override;
     Result<void> remove_device(const Session& session, Id device) override;
+    Result<DefaultRooms> ensure_default_conversations(Id account, Id self_conversation,
+                                                      Id system_conversation, Id system_event_key,
+                                                      Id self_event_key,
+                                                      std::string_view welcome_json,
+                                                      std::string_view self_welcome_json) override;
+    Result<void> append_system_notice(Id account, Id client_message_id,
+                                      std::string_view json_payload) override;
+    Result<std::vector<AccountProfile>> list_contacts(const Session& session) override;
+    Result<AccountProfile> add_contact(const Session& session, Id target, Sequence now) override;
+    Result<void> remove_contact(const Session& session, Id target) override;
+    Result<MediaMeta> put_media_single(const Session& session, Id conversation, Id media_id,
+                                       std::string_view mime_type, std::string_view filename,
+                                       std::span<const std::byte> data, Sequence now) override;
+    Result<void> create_media_upload(const Session& session, Id conversation, Id media_id,
+                                     std::string_view mime_type, std::string_view filename,
+                                     Sequence now) override;
+    Result<void> put_media_chunk(const Session& session, Id conversation, Id media_id,
+                                 Sequence chunk_index, std::span<const std::byte> data) override;
+    Result<MediaMeta> complete_media_upload(const Session& session, Id conversation, Id media_id,
+                                            Sequence expected_chunks) override;
+    Result<StoredMedia> get_media(const Session& session, Id conversation, Id media_id) override;
 
   private:
     template <typename Operation> auto transact(TransactionMode mode, Operation&& operation) {
@@ -220,6 +299,7 @@ class SqlStore final : public Store {
     Result<void> authenticate(const Session& session);
     Result<Room> authorized_room(const Session& session, Id conversation);
     Result<std::vector<AccountProfile>> conversation_members(Id conversation);
+    void ensure_system_actor();
 
     std::unique_ptr<Database> db_;
 };
@@ -294,12 +374,27 @@ Result<Room> SqlStore::authorized_room(const Session& session, Id conversation) 
     if (!allowed) {
         return fail(Error::NotFoundOrForbidden);
     }
-    auto room = db_->query("SELECT last_seq, retained_after FROM lim_conversation WHERE id = $1",
-                           {blob(conversation)});
+    auto room = db_->query(
+        "SELECT last_seq, retained_after, kind FROM lim_conversation WHERE id = $1",
+        {blob(conversation)});
     if (!room->next()) {
         return fail(Error::NotFoundOrForbidden);
     }
-    return Room{room->integer(0), room->integer(1), joined_after};
+    return Room{room->integer(0), room->integer(1), joined_after, text(*room, 2)};
+}
+
+void SqlStore::ensure_system_actor() {
+    db_->exec(R"SQL(
+        INSERT INTO lim_account(id, display_name) VALUES ($1, 'LIM 系统通知')
+        ON CONFLICT DO NOTHING
+    )SQL",
+              {blob(kSystemAccount)});
+    db_->exec(R"SQL(
+        INSERT INTO lim_device(id, account, credential, name)
+        VALUES ($1, $2, $3, 'LIM System')
+        ON CONFLICT DO NOTHING
+    )SQL",
+              {blob(kSystemDevice), blob(kSystemAccount), blob(kSystemCredential)});
 }
 
 Result<std::vector<AccountProfile>> SqlStore::conversation_members(Id conversation) {
@@ -496,6 +591,9 @@ Result<Receipt> SqlStore::append(const Session& session, const Append& cmd) {
         const auto room = authorized_room(session, cmd.conversation);
         if (!room) {
             return std::unexpected(room.error());
+        }
+        if (room->kind == "system") {
+            return fail(Error::NotFoundOrForbidden);
         }
         if (cmd.payload.empty()) {
             return fail(Error::InvalidArgument);
@@ -769,13 +867,14 @@ Result<std::vector<AccountProfile>> SqlStore::search_accounts(const Session& ses
         if (const auto auth = authenticate(session); !auth) {
             return std::unexpected(auth.error());
         }
-        const auto pattern = std::string(prefix) + "%";
+        const auto user_pattern = std::string(prefix) + "%";
+        const auto name_pattern = "%" + std::string(prefix) + "%";
         auto rows = db_->query(R"SQL(
             SELECT id, username, display_name FROM lim_account
-            WHERE username IS NOT NULL AND username LIKE $1
-            ORDER BY username LIMIT $2
+            WHERE username IS NOT NULL AND (username LIKE $1 OR LOWER(display_name) LIKE $2)
+            ORDER BY username LIMIT $3
         )SQL",
-                               {view(pattern), limit});
+                               {view(user_pattern), view(name_pattern), limit});
         std::vector<AccountProfile> accounts;
         while (rows->next()) {
             accounts.push_back({decode_id(rows->bytes(0)), text(*rows, 1), text(*rows, 2)});
@@ -796,23 +895,28 @@ Result<ConversationSummary> SqlStore::start_conversation(const Session& session,
         if (!verify_generation(session.generation)) {
             return fail(Error::RecoveryRequired);
         }
-        if (!direct_key.empty()) {
+        const std::string kind_owned(kind);
+        const std::string title_owned(title);
+        const std::string direct_key_owned(direct_key);
+        if (!direct_key_owned.empty()) {
             auto existing = db_->query(R"SQL(
-                SELECT id, last_seq, retained_after FROM lim_conversation
+                SELECT id, last_seq, retained_after, kind, title FROM lim_conversation
                 WHERE direct_key = $1
             )SQL",
-                                       {direct_key});
+                                       {view(direct_key_owned)});
             if (existing->next()) {
                 const auto id = decode_id(existing->bytes(0));
                 const auto last_seq = existing->integer(1);
                 const auto floor = existing->integer(2);
+                const auto stored_kind = text(*existing, 3);
+                const auto stored_title = text(*existing, 4);
                 existing.reset();
                 const auto members = conversation_members(id);
                 if (!members) {
                     return std::unexpected(members.error());
                 }
-                return ConversationSummary{id, floor, last_seq, std::string(kind),
-                                           std::string(title), *members, true};
+                return ConversationSummary{id, floor, last_seq, stored_kind, stored_title, *members,
+                                           true};
             }
             existing.reset();
         }
@@ -835,7 +939,8 @@ Result<ConversationSummary> SqlStore::start_conversation(const Session& session,
             INSERT INTO lim_conversation(id, kind, title, direct_key, created_by)
             VALUES ($1, $2, $3, NULLIF($4, ''), $5)
         )SQL",
-                  {blob(conversation), kind, title, direct_key, blob(session.account)});
+                  {blob(conversation), view(kind_owned), view(title_owned), view(direct_key_owned),
+                   blob(session.account)});
         for (const auto member : members) {
             db_->exec(R"SQL(
                 INSERT INTO lim_account_member(conversation, account, joined_after)
@@ -843,12 +948,23 @@ Result<ConversationSummary> SqlStore::start_conversation(const Session& session,
             )SQL",
                       {blob(conversation), blob(member)});
         }
+        if (kind_owned == "direct" && members.size() == 2) {
+            db_->exec(R"SQL(
+                INSERT INTO lim_contact(owner, contact, created_at)
+                VALUES ($1, $2, 0) ON CONFLICT DO NOTHING
+            )SQL",
+                      {blob(members[0]), blob(members[1])});
+            db_->exec(R"SQL(
+                INSERT INTO lim_contact(owner, contact, created_at)
+                VALUES ($1, $2, 0) ON CONFLICT DO NOTHING
+            )SQL",
+                      {blob(members[1]), blob(members[0])});
+        }
         const auto profiles = conversation_members(conversation);
         if (!profiles) {
             return std::unexpected(profiles.error());
         }
-        return ConversationSummary{conversation, 0, 0, std::string(kind), std::string(title),
-                                   *profiles, true};
+        return ConversationSummary{conversation, 0, 0, kind_owned, title_owned, *profiles, true};
     });
 }
 
@@ -887,6 +1003,372 @@ Result<void> SqlStore::remove_device(const Session& session, Id device) {
         db_->exec("DELETE FROM lim_member WHERE device = $1", {blob(device)});
         db_->exec("UPDATE lim_auth_session SET revoked = 1 WHERE device = $1", {blob(device)});
         return {};
+    });
+}
+
+Result<DefaultRooms> SqlStore::ensure_default_conversations(
+    Id account, Id self_conversation, Id system_conversation, Id system_event_key,
+    Id self_event_key, std::string_view welcome_json, std::string_view self_welcome_json) {
+    return transact(TransactionMode::Write, [&]() -> Result<DefaultRooms> {
+        ensure_system_actor();
+        const auto account_hex = hex_id(account);
+        const auto ensure_room = [&](const std::string& key, Id new_id, std::string_view kind,
+                                     std::string_view title, Id initial_key,
+                                     std::string_view initial_json) -> Result<ConversationSummary> {
+            const std::string kind_owned(kind);
+            const std::string title_owned(title);
+            auto existing = db_->query(R"SQL(
+                SELECT id, last_seq, retained_after, kind, title FROM lim_conversation
+                WHERE direct_key = $1
+            )SQL",
+                                       {view(key)});
+            if (existing->next()) {
+                const auto id = decode_id(existing->bytes(0));
+                const auto last_seq = existing->integer(1);
+                const auto floor = existing->integer(2);
+                const auto stored_kind = text(*existing, 3);
+                const auto stored_title = text(*existing, 4);
+                existing.reset();
+                db_->exec(R"SQL(
+                    INSERT INTO lim_account_member(conversation, account, joined_after)
+                    VALUES ($1, $2, 0) ON CONFLICT DO NOTHING
+                )SQL",
+                          {blob(id), blob(account)});
+                const auto members = conversation_members(id);
+                if (!members) {
+                    return std::unexpected(members.error());
+                }
+                return ConversationSummary{id, floor, last_seq, stored_kind, stored_title, *members,
+                                           true};
+            }
+            existing.reset();
+            const Sequence initial_seq = initial_json.empty() ? 0 : 1;
+            db_->exec(R"SQL(
+                INSERT INTO lim_conversation(id, last_seq, retained_after, kind, title, direct_key,
+                                             created_by)
+                VALUES ($1, $2, 0, $3, $4, $5, $6)
+            )SQL",
+                      {blob(new_id), initial_seq, view(kind_owned), view(title_owned), view(key),
+                       blob(account)});
+            db_->exec(R"SQL(
+                INSERT INTO lim_account_member(conversation, account, joined_after)
+                VALUES ($1, $2, 0) ON CONFLICT DO NOTHING
+            )SQL",
+                      {blob(new_id), blob(account)});
+            if (!initial_json.empty()) {
+                const auto payload =
+                    std::as_bytes(std::span(initial_json.data(), initial_json.size()));
+                db_->exec(R"SQL(
+                    INSERT INTO lim_event(conversation, seq, device, client_key, format, payload)
+                    VALUES ($1, 1, $2, $3, $4, $5)
+                )SQL",
+                          {blob(new_id), blob(kSystemDevice), blob(initial_key), kJson, payload});
+            }
+            const auto members = conversation_members(new_id);
+            if (!members) {
+                return std::unexpected(members.error());
+            }
+            return ConversationSummary{new_id, 0, initial_seq, kind_owned, title_owned, *members,
+                                       true};
+        };
+
+        const auto self_room = ensure_room("self:" + account_hex, self_conversation, "self",
+                                           "与自己对话", self_event_key, self_welcome_json);
+        if (!self_room) {
+            return std::unexpected(self_room.error());
+        }
+        const auto system_room = ensure_room("system:" + account_hex, system_conversation, "system",
+                                             "系统消息", system_event_key, welcome_json);
+        if (!system_room) {
+            return std::unexpected(system_room.error());
+        }
+        return DefaultRooms{*self_room, *system_room};
+    });
+}
+
+Result<void> SqlStore::append_system_notice(Id account, Id client_message_id,
+                                            std::string_view json_payload) {
+    return transact(TransactionMode::Write, [&]() -> Result<void> {
+        if (json_payload.empty() || json_payload.size() > kMessageBytes) {
+            return fail(Error::InvalidArgument);
+        }
+        ensure_system_actor();
+        const auto key = "system:" + hex_id(account);
+        auto room = db_->query("SELECT id, last_seq FROM lim_conversation WHERE direct_key = $1",
+                               {view(key)});
+        if (!room->next()) {
+            return {};
+        }
+        const auto conversation = decode_id(room->bytes(0));
+        const auto seq = room->integer(1) + 1;
+        room.reset();
+        const auto payload = std::as_bytes(std::span(json_payload.data(), json_payload.size()));
+        db_->exec(R"SQL(
+            INSERT INTO lim_event(conversation, seq, device, client_key, format, payload)
+            VALUES ($1, $2, $3, $4, $5, $6)
+        )SQL",
+                  {blob(conversation), seq, blob(kSystemDevice), blob(client_message_id), kJson,
+                   payload});
+        db_->exec("UPDATE lim_conversation SET last_seq = $2 WHERE id = $1",
+                  {blob(conversation), seq});
+        return {};
+    });
+}
+
+Result<std::vector<AccountProfile>> SqlStore::list_contacts(const Session& session) {
+    return transact(TransactionMode::Read, [&]() -> Result<std::vector<AccountProfile>> {
+        if (const auto auth = authenticate(session); !auth) {
+            return std::unexpected(auth.error());
+        }
+        auto rows = db_->query(R"SQL(
+            SELECT a.id, a.username, a.display_name
+            FROM lim_contact c JOIN lim_account a ON a.id = c.contact
+            WHERE c.owner = $1 AND a.username IS NOT NULL
+            ORDER BY a.display_name, a.username
+        )SQL",
+                               {blob(session.account)});
+        std::vector<AccountProfile> contacts;
+        while (rows->next()) {
+            contacts.push_back({decode_id(rows->bytes(0)), text(*rows, 1), text(*rows, 2)});
+        }
+        return contacts;
+    });
+}
+
+Result<AccountProfile> SqlStore::add_contact(const Session& session, Id target, Sequence now) {
+    return transact(TransactionMode::Write, [&]() -> Result<AccountProfile> {
+        if (const auto auth = authenticate(session); !auth) {
+            return std::unexpected(auth.error());
+        }
+        if (target == session.account) {
+            return fail(Error::InvalidArgument);
+        }
+        auto found = db_->query(R"SQL(
+            SELECT id, username, display_name FROM lim_account
+            WHERE id = $1 AND username IS NOT NULL
+        )SQL",
+                                {blob(target)});
+        if (!found->next()) {
+            return fail(Error::NotFoundOrForbidden);
+        }
+        AccountProfile profile{decode_id(found->bytes(0)), text(*found, 1), text(*found, 2)};
+        found.reset();
+        db_->exec(R"SQL(
+            INSERT INTO lim_contact(owner, contact, created_at)
+            VALUES ($1, $2, $3) ON CONFLICT DO NOTHING
+        )SQL",
+                  {blob(session.account), blob(target), now});
+        return profile;
+    });
+}
+
+Result<void> SqlStore::remove_contact(const Session& session, Id target) {
+    return transact(TransactionMode::Write, [&]() -> Result<void> {
+        if (const auto auth = authenticate(session); !auth) {
+            return auth;
+        }
+        db_->exec("DELETE FROM lim_contact WHERE owner = $1 AND contact = $2",
+                  {blob(session.account), blob(target)});
+        return {};
+    });
+}
+
+Result<MediaMeta> SqlStore::put_media_single(const Session& session, Id conversation, Id media_id,
+                                             std::string_view mime_type, std::string_view filename,
+                                             std::span<const std::byte> data, Sequence now) {
+    return transact(TransactionMode::Write, [&]() -> Result<MediaMeta> {
+        const auto room = authorized_room(session, conversation);
+        if (!room) {
+            return std::unexpected(room.error());
+        }
+        if (room->kind == "system") {
+            return fail(Error::NotFoundOrForbidden);
+        }
+        if (data.empty() || mime_type.empty() || mime_type.size() > 128 || filename.size() > 255) {
+            return fail(Error::InvalidArgument);
+        }
+        if (data.size() > kMediaMaxChunkBytes) {
+            return fail(Error::PayloadTooLarge);
+        }
+        const std::string mime_owned(mime_type);
+        const std::string name_owned(filename);
+        const auto size = static_cast<Sequence>(data.size());
+        db_->exec(R"SQL(
+            INSERT INTO lim_media(id, conversation, uploader_account, uploader_device,
+                                  mime_type, filename, size_bytes, complete, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8)
+        )SQL",
+                  {blob(media_id), blob(conversation), blob(session.account), blob(session.device),
+                   view(mime_owned), view(name_owned), size, now});
+        db_->exec(R"SQL(
+            INSERT INTO lim_media_chunk(media, chunk_index, content) VALUES ($1, 0, $2)
+        )SQL",
+                  {blob(media_id), data});
+        return MediaMeta{media_id, conversation, mime_owned, name_owned, size, now};
+    });
+}
+
+Result<void> SqlStore::create_media_upload(const Session& session, Id conversation, Id media_id,
+                                           std::string_view mime_type, std::string_view filename,
+                                           Sequence now) {
+    return transact(TransactionMode::Write, [&]() -> Result<void> {
+        const auto room = authorized_room(session, conversation);
+        if (!room) {
+            return std::unexpected(room.error());
+        }
+        if (room->kind == "system") {
+            return fail(Error::NotFoundOrForbidden);
+        }
+        if (mime_type.empty() || mime_type.size() > 128 || filename.size() > 255) {
+            return fail(Error::InvalidArgument);
+        }
+        const std::string mime_owned(mime_type);
+        const std::string name_owned(filename);
+        db_->exec(R"SQL(
+            INSERT INTO lim_media(id, conversation, uploader_account, uploader_device,
+                                  mime_type, filename, size_bytes, complete, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 0, 0, $7)
+        )SQL",
+                  {blob(media_id), blob(conversation), blob(session.account), blob(session.device),
+                   view(mime_owned), view(name_owned), now});
+        return {};
+    });
+}
+
+Result<void> SqlStore::put_media_chunk(const Session& session, Id conversation, Id media_id,
+                                       Sequence chunk_index, std::span<const std::byte> data) {
+    return transact(TransactionMode::Write, [&]() -> Result<void> {
+        const auto room = authorized_room(session, conversation);
+        if (!room) {
+            return std::unexpected(room.error());
+        }
+        if (room->kind == "system") {
+            return fail(Error::NotFoundOrForbidden);
+        }
+        if (chunk_index < 0 || chunk_index >= kMaxMediaChunks || data.empty()) {
+            return fail(Error::InvalidArgument);
+        }
+        if (data.size() > kMediaMaxChunkBytes) {
+            return fail(Error::PayloadTooLarge);
+        }
+        auto media = db_->query(R"SQL(
+            SELECT uploader_account, complete FROM lim_media
+            WHERE id = $1 AND conversation = $2
+        )SQL",
+                                {blob(media_id), blob(conversation)});
+        if (!media->next() || decode_id(media->bytes(0)) != session.account ||
+            media->integer(1) != 0) {
+            return fail(Error::NotFoundOrForbidden);
+        }
+        media.reset();
+        auto totals = db_->query(R"SQL(
+            SELECT CAST(COALESCE(SUM(length(content)), 0) AS BIGINT)
+            FROM lim_media_chunk WHERE media = $1 AND chunk_index <> $2
+        )SQL",
+                                 {blob(media_id), chunk_index});
+        if (!totals->next()) {
+            return fail(Error::TemporarilyUnavailable);
+        }
+        const auto existing_bytes = totals->integer(0);
+        totals.reset();
+        if (existing_bytes + static_cast<Sequence>(data.size()) >
+            static_cast<Sequence>(kMediaMaxBytes)) {
+            return fail(Error::PayloadTooLarge);
+        }
+        db_->exec(R"SQL(
+            INSERT INTO lim_media_chunk(media, chunk_index, content) VALUES ($1, $2, $3)
+            ON CONFLICT (media, chunk_index) DO UPDATE SET content = EXCLUDED.content
+        )SQL",
+                  {blob(media_id), chunk_index, data});
+        return {};
+    });
+}
+
+Result<MediaMeta> SqlStore::complete_media_upload(const Session& session, Id conversation,
+                                                  Id media_id, Sequence expected_chunks) {
+    return transact(TransactionMode::Write, [&]() -> Result<MediaMeta> {
+        const auto room = authorized_room(session, conversation);
+        if (!room) {
+            return std::unexpected(room.error());
+        }
+        if (expected_chunks <= 0 || expected_chunks > kMaxMediaChunks) {
+            return fail(Error::InvalidArgument);
+        }
+        auto media = db_->query(R"SQL(
+            SELECT uploader_account, mime_type, filename, created_at, complete, size_bytes
+            FROM lim_media WHERE id = $1 AND conversation = $2
+        )SQL",
+                                {blob(media_id), blob(conversation)});
+        if (!media->next() || decode_id(media->bytes(0)) != session.account) {
+            return fail(Error::NotFoundOrForbidden);
+        }
+        const auto mime_type = text(*media, 1);
+        const auto filename = text(*media, 2);
+        const auto created_at = media->integer(3);
+        const auto already_complete = media->integer(4) != 0;
+        const auto saved_size = media->integer(5);
+        media.reset();
+        if (already_complete) {
+            return MediaMeta{media_id, conversation, mime_type, filename, saved_size, created_at};
+        }
+        auto stats = db_->query(R"SQL(
+            SELECT COUNT(*),
+                   COALESCE(MIN(chunk_index), CAST(-1 AS BIGINT)),
+                   COALESCE(MAX(chunk_index), CAST(-1 AS BIGINT)),
+                   CAST(COALESCE(SUM(length(content)), 0) AS BIGINT)
+            FROM lim_media_chunk WHERE media = $1
+        )SQL",
+                                {blob(media_id)});
+        if (!stats->next()) {
+            return fail(Error::InvalidArgument);
+        }
+        const auto count = stats->integer(0);
+        const auto min_idx = stats->integer(1);
+        const auto max_idx = stats->integer(2);
+        const auto total_bytes = stats->integer(3);
+        stats.reset();
+        if (count != expected_chunks || min_idx != 0 || max_idx != expected_chunks - 1 ||
+            total_bytes <= 0 || total_bytes > static_cast<Sequence>(kMediaMaxBytes)) {
+            return fail(Error::InvalidArgument);
+        }
+        db_->exec("UPDATE lim_media SET complete = 1, size_bytes = $2 WHERE id = $1",
+                  {blob(media_id), total_bytes});
+        return MediaMeta{media_id, conversation, mime_type, filename, total_bytes, created_at};
+    });
+}
+
+Result<StoredMedia> SqlStore::get_media(const Session& session, Id conversation, Id media_id) {
+    return transact(TransactionMode::Read, [&]() -> Result<StoredMedia> {
+        const auto room = authorized_room(session, conversation);
+        if (!room) {
+            return std::unexpected(room.error());
+        }
+        auto media = db_->query(R"SQL(
+            SELECT mime_type, filename, size_bytes, created_at
+            FROM lim_media WHERE id = $1 AND conversation = $2 AND complete = 1
+        )SQL",
+                                {blob(media_id), blob(conversation)});
+        if (!media->next()) {
+            return fail(Error::NotFoundOrForbidden);
+        }
+        StoredMedia result{};
+        result.meta.id = media_id;
+        result.meta.conversation = conversation;
+        result.meta.mime_type = text(*media, 0);
+        result.meta.filename = text(*media, 1);
+        result.meta.size_bytes = media->integer(2);
+        result.meta.created_at = media->integer(3);
+        media.reset();
+        result.content.reserve(static_cast<std::size_t>(result.meta.size_bytes));
+        auto chunks = db_->query(R"SQL(
+            SELECT content FROM lim_media_chunk WHERE media = $1 ORDER BY chunk_index
+        )SQL",
+                                 {blob(media_id)});
+        while (chunks->next()) {
+            const auto part = chunks->bytes(0);
+            result.content.insert(result.content.end(), part.begin(), part.end());
+        }
+        return result;
     });
 }
 

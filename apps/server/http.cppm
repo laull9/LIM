@@ -26,6 +26,7 @@ export module lim.server.http;
 import lim.server.binary;
 import lim.server.config;
 import lim.server.contract;
+import lim.server.media;
 import lim.server.rpc;
 import lim.storage;
 
@@ -86,6 +87,35 @@ void respond_wire(LWeb::Response& response, const Config& config, WireReply repl
         response.add_header("Retry-After", "1");
     }
     respond(response, static_cast<Status>(reply.status), std::move(reply.body), reply.type);
+}
+
+void respond_media(LWeb::Response& response, MediaReply reply) {
+    response.add_header("X-Content-Type-Options", "nosniff");
+    if (reply.cacheable) {
+        response.add_header("Cache-Control", "private, max-age=3600");
+    } else {
+        response.add_header("Cache-Control", "no-store");
+    }
+    if (reply.accept_ranges) {
+        response.add_header("Accept-Ranges", "bytes");
+    }
+    if (!reply.content_disposition.empty()) {
+        response.add_header("Content-Disposition", reply.content_disposition);
+    }
+    if (!reply.content_range.empty()) {
+        response.add_header("Content-Range", reply.content_range);
+    }
+    if (reply.status == 401) {
+        response.add_header("WWW-Authenticate", "Bearer");
+    }
+    if (reply.status == 503) {
+        response.add_header("Retry-After", "1");
+    }
+    if (reply.status != 204 && reply.status != 416) {
+        response.add_header("Content-Type", reply.type);
+    }
+    response.set_status(static_cast<Status>(reply.status));
+    response.set_content(std::move(reply.body));
 }
 
 struct HeaderCounts {
@@ -211,6 +241,11 @@ class Routes {
     LWeb::Task<> binary_send(LWeb::Request& request, LWeb::Response& response);
     LWeb::Task<> binary_read(LWeb::Request& request, LWeb::Response& response);
     LWeb::Task<> wait(LWeb::Request& request, LWeb::Response& response);
+    LWeb::Task<> media_upload(LWeb::Request& request, LWeb::Response& response);
+    LWeb::Task<> media_init(LWeb::Request& request, LWeb::Response& response);
+    LWeb::Task<> media_chunk(LWeb::Request& request, LWeb::Response& response);
+    LWeb::Task<> media_complete(LWeb::Request& request, LWeb::Response& response);
+    LWeb::Task<> media_download(LWeb::Request& request, LWeb::Response& response);
 
     LWeb::Task<> rpc(LWeb::Request& request, LWeb::Response& response) {
         const RequestGuard active(requests_);
@@ -275,6 +310,24 @@ class Routes {
         try {
             auto outcome = co_await coro_io::post(std::move(operation), worker_.get_executor());
             respond_wire(response, config_, std::move(outcome.value()));
+        } catch (const std::exception&) {
+            respond(response, Status::internal_server_error);
+        }
+        response.set_delay(true);
+        co_await request.get_conn()->reply();
+    }
+
+    template <typename Operation>
+    LWeb::Task<> serve_media(LWeb::Request& request, LWeb::Response& response,
+                             Operation operation) {
+        if (!slots_.try_acquire()) {
+            respond_wire(response, config_, wire_error({Error::Overloaded, std::nullopt}));
+            co_return;
+        }
+        const Slot slot{slots_};
+        try {
+            auto outcome = co_await coro_io::post(std::move(operation), worker_.get_executor());
+            respond_media(response, std::move(outcome.value()));
         } catch (const std::exception&) {
             respond(response, Status::internal_server_error);
         }
@@ -442,6 +495,184 @@ LWeb::Task<> Routes::wait(LWeb::Request& request, LWeb::Response& response) {
     } while (true);
 }
 
+LWeb::Task<> Routes::media_upload(LWeb::Request& request, LWeb::Response& response) {
+    const RequestGuard active(requests_);
+    if (!active) {
+        respond(response, Status::service_unavailable);
+        co_return;
+    }
+    if (request.get_method() != "POST") {
+        response.add_header("Allow", "POST");
+        respond(response, Status::method_not_allowed);
+        co_return;
+    }
+    const auto counts = count_headers(request);
+    if (counts.transfer_encoding || counts.length > 1) {
+        co_await reject_framing(request, response);
+        co_return;
+    }
+    const auto conversation = parse_id(LWeb::Param(request, "id"));
+    const auto generation = parse_id(request.get_header_value("LIM-Generation"));
+    if (!conversation || *conversation == Id{} || !generation || counts.authorization > 1 ||
+        counts.generation != 1) {
+        respond_wire(response, config_, wire_error({Error::InvalidArgument, std::nullopt}));
+        co_return;
+    }
+    const std::string token(bearer_token(request.get_header_value("Authorization")));
+    const std::string mime(request.get_header_value("Content-Type"));
+    const std::string filename(request.get_header_value("X-LIM-Filename"));
+    const auto body = request.get_body();
+    co_await serve_media(
+        request, response,
+        [this, token, generation = *generation, conversation = *conversation, mime, filename, body] {
+            return upload_media_single(store_, config_, token, generation, conversation, mime,
+                                       filename, body);
+        });
+}
+
+LWeb::Task<> Routes::media_init(LWeb::Request& request, LWeb::Response& response) {
+    const RequestGuard active(requests_);
+    if (!active) {
+        respond(response, Status::service_unavailable);
+        co_return;
+    }
+    if (request.get_method() != "POST") {
+        response.add_header("Allow", "POST");
+        respond(response, Status::method_not_allowed);
+        co_return;
+    }
+    const auto counts = count_headers(request);
+    if (counts.transfer_encoding || counts.length > 1) {
+        co_await reject_framing(request, response);
+        co_return;
+    }
+    if (!media_type_is(request.get_header_value("Content-Type"), "application/json")) {
+        respond(response, Status::unsupported_media_type);
+        co_return;
+    }
+    const auto conversation = parse_id(LWeb::Param(request, "id"));
+    const auto generation = parse_id(request.get_header_value("LIM-Generation"));
+    if (!conversation || *conversation == Id{} || !generation || counts.authorization > 1 ||
+        counts.generation != 1) {
+        respond_wire(response, config_, wire_error({Error::InvalidArgument, std::nullopt}));
+        co_return;
+    }
+    const std::string token(bearer_token(request.get_header_value("Authorization")));
+    const auto body = request.get_body();
+    co_await serve_media(
+        request, response,
+        [this, token, generation = *generation, conversation = *conversation, body] {
+            return init_media_upload(store_, config_, token, generation, conversation, body);
+        });
+}
+
+LWeb::Task<> Routes::media_chunk(LWeb::Request& request, LWeb::Response& response) {
+    const RequestGuard active(requests_);
+    if (!active) {
+        respond(response, Status::service_unavailable);
+        co_return;
+    }
+    if (request.get_method() != "PUT") {
+        response.add_header("Allow", "PUT");
+        respond(response, Status::method_not_allowed);
+        co_return;
+    }
+    const auto counts = count_headers(request);
+    if (counts.transfer_encoding || counts.length > 1) {
+        co_await reject_framing(request, response);
+        co_return;
+    }
+    const auto conversation = parse_id(LWeb::Param(request, "id"));
+    const auto media_id = parse_id(LWeb::Param(request, "media_id"));
+    const auto chunk_index = parse_sequence(LWeb::Param(request, "index"));
+    const auto generation = parse_id(request.get_header_value("LIM-Generation"));
+    if (!conversation || *conversation == Id{} || !media_id || *media_id == Id{} || !chunk_index ||
+        !generation || counts.authorization > 1 || counts.generation != 1) {
+        respond_wire(response, config_, wire_error({Error::InvalidArgument, std::nullopt}));
+        co_return;
+    }
+    const std::string token(bearer_token(request.get_header_value("Authorization")));
+    const auto body = request.get_body();
+    co_await serve_media(request, response,
+                         [this, token, generation = *generation, conversation = *conversation,
+                          media_id = *media_id, chunk_index = *chunk_index, body] {
+                             return upload_media_chunk(store_, config_, token, generation,
+                                                       conversation, media_id, chunk_index, body);
+                         });
+}
+
+LWeb::Task<> Routes::media_complete(LWeb::Request& request, LWeb::Response& response) {
+    const RequestGuard active(requests_);
+    if (!active) {
+        respond(response, Status::service_unavailable);
+        co_return;
+    }
+    if (request.get_method() != "POST") {
+        response.add_header("Allow", "POST");
+        respond(response, Status::method_not_allowed);
+        co_return;
+    }
+    const auto counts = count_headers(request);
+    if (counts.transfer_encoding || counts.length > 1) {
+        co_await reject_framing(request, response);
+        co_return;
+    }
+    if (!media_type_is(request.get_header_value("Content-Type"), "application/json")) {
+        respond(response, Status::unsupported_media_type);
+        co_return;
+    }
+    const auto conversation = parse_id(LWeb::Param(request, "id"));
+    const auto media_id = parse_id(LWeb::Param(request, "media_id"));
+    const auto generation = parse_id(request.get_header_value("LIM-Generation"));
+    if (!conversation || *conversation == Id{} || !media_id || *media_id == Id{} || !generation ||
+        counts.authorization > 1 || counts.generation != 1) {
+        respond_wire(response, config_, wire_error({Error::InvalidArgument, std::nullopt}));
+        co_return;
+    }
+    const std::string token(bearer_token(request.get_header_value("Authorization")));
+    const auto body = request.get_body();
+    co_await serve_media(request, response,
+                         [this, token, generation = *generation, conversation = *conversation,
+                          media_id = *media_id, body] {
+                             return complete_media_upload(store_, config_, token, generation,
+                                                          conversation, media_id, body);
+                         });
+}
+
+LWeb::Task<> Routes::media_download(LWeb::Request& request, LWeb::Response& response) {
+    const RequestGuard active(requests_);
+    if (!active) {
+        respond(response, Status::service_unavailable);
+        co_return;
+    }
+    if (request.get_method() != "GET") {
+        response.add_header("Allow", "GET");
+        respond(response, Status::method_not_allowed);
+        co_return;
+    }
+    const auto counts = count_headers(request);
+    if (counts.transfer_encoding || counts.length > 1) {
+        co_await reject_framing(request, response);
+        co_return;
+    }
+    const auto conversation = parse_id(LWeb::Param(request, "id"));
+    const auto media_id = parse_id(LWeb::Param(request, "media_id"));
+    const auto generation = parse_id(request.get_header_value("LIM-Generation"));
+    if (!conversation || *conversation == Id{} || !media_id || *media_id == Id{} || !generation ||
+        counts.authorization > 1 || counts.generation != 1) {
+        respond_wire(response, config_, wire_error({Error::InvalidArgument, std::nullopt}));
+        co_return;
+    }
+    const std::string token(bearer_token(request.get_header_value("Authorization")));
+    const std::string range(request.get_header_value("Range"));
+    co_await serve_media(request, response,
+                         [this, token, generation = *generation, conversation = *conversation,
+                          media_id = *media_id, range] {
+                             return download_media(store_, config_, token, generation, conversation,
+                                                   media_id, range);
+                         });
+}
+
 } // namespace
 
 int serve(const Config& config, Store& store) {
@@ -452,7 +683,7 @@ int serve(const Config& config, Store& store) {
         .threads = 1,
         .max_body_size = kRpcRequestBytes,
         .max_header_size = 8 * 1024,
-        .idle_timeout = 10s,
+        .idle_timeout = 30s,
     });
     app.Native().set_shrink_to_fit(true);
     app.Any("/health/live", [](LWeb::Request& request, LWeb::Response& response) {
@@ -468,6 +699,13 @@ int serve(const Config& config, Store& store) {
     app.Any("/v1/conversations/:id/messages", &routes, &Routes::binary_send);
     app.Any("/v1/conversations/:id/events", &routes, &Routes::binary_read);
     app.Any("/v1/conversations/:id/wait", &routes, &Routes::wait);
+    app.Any("/v1/conversations/:id/media", &routes, &Routes::media_upload);
+    app.Any("/v1/conversations/:id/media/:media_id", &routes, &Routes::media_download);
+    app.Any("/v1/conversations/:id/media-uploads", &routes, &Routes::media_init);
+    app.Any("/v1/conversations/:id/media-uploads/:media_id/chunks/:index", &routes,
+            &Routes::media_chunk);
+    app.Any("/v1/conversations/:id/media-uploads/:media_id/complete", &routes,
+            &Routes::media_complete);
 
     asio::io_context signals;
     asio::signal_set stop(signals, SIGINT, SIGTERM);

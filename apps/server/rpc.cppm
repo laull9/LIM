@@ -125,21 +125,57 @@ std::string device_name_field(const Json& params) {
 
 std::string search_prefix(std::string_view input) {
     const auto value = trim(input);
-    if (value.empty() || value.size() > 24) {
+    if (value.empty() || value.size() > 32 || !LString::valid_utf8(value)) {
         throw InvalidParams{};
     }
     std::string result;
+    result.reserve(value.size());
     for (const char raw : value) {
         const auto byte = static_cast<unsigned char>(raw);
+        if (byte < 0x20 || byte == 0x7f || byte == '%' || byte == '\\') {
+            throw InvalidParams{};
+        }
         if (byte >= 'A' && byte <= 'Z') {
             result.push_back(static_cast<char>(byte + ('a' - 'A')));
-        } else if ((byte >= 'a' && byte <= 'z') || (byte >= '0' && byte <= '9') || byte == '_') {
-            result.push_back(static_cast<char>(byte));
         } else {
-            throw InvalidParams{};
+            result.push_back(raw);
         }
     }
     return result;
+}
+
+std::string make_system_payload(std::string_view title, std::string_view text) {
+    auto doc = Json::object();
+    doc["v"] = 1;
+    doc["lim_msg"] = true;
+    doc["kind"] = "system";
+    if (!title.empty()) {
+        doc["title"] = std::string(title);
+    }
+    doc["text"] = std::string(text);
+    doc["ts"] = current_time() * 1000;
+    return doc.dump();
+}
+
+Result<DefaultRooms> ensure_defaults(Store& store, Id account, std::string_view username,
+                                     std::string_view display_name, std::string_view device_name) {
+    const auto self_room = random_id();
+    const auto system_room = random_id();
+    const auto sys_key = random_id();
+    const auto self_key = random_id();
+    if (!self_room || !system_room || !sys_key || !self_key) {
+        throw std::runtime_error("cannot create default conversation identifiers");
+    }
+    const std::string welcome_text =
+        "欢迎来到 LIM，" + std::string(display_name) + "（@" + std::string(username) +
+        "）！当前设备「" + std::string(device_name) +
+        "」已自动登记。你可以先在「与自己对话」里测试文字、语音、照片、视频或文件，也可以在左侧「联系人」中按用户名搜索好友。当前会话为宿主可读模式。";
+    const std::string self_text =
+        "这里是你的私人空间「与自己对话」。在这里发送的笔记、语音、照片、视频和文件都会在你的所有已登录设备之间实时同步。";
+    const auto welcome_json = make_system_payload("欢迎使用 LIM", welcome_text);
+    const auto self_json = make_system_payload("我的随手记", self_text);
+    return store.ensure_default_conversations(account, *self_room, *system_room, *sys_key,
+                                              *self_key, welcome_json, self_json);
 }
 
 struct TokenPair {
@@ -252,7 +288,7 @@ Json summary_json(const ConversationSummary& summary) {
     return result;
 }
 
-Json register_account(Store& store, const Json& params) {
+Json register_account(Store& store, const Json& params, std::atomic<std::uint64_t>& revision) {
     const auto username = normalized_username(text_field(params, "username"));
     const auto raw_display_name = text_field(params, "display_name");
     const auto display_name = trim(raw_display_name);
@@ -279,10 +315,12 @@ Json register_account(Store& store, const Json& params) {
                            tokens.refresh_digest, tokens.now, tokens.access_expires,
                            tokens.refresh_expires);
     require(context);
+    require(ensure_defaults(store, *account, *username, display_name, name));
+    revision.fetch_add(1);
     return auth_response(*context, tokens);
 }
 
-Json login_account(Store& store, const Json& params) {
+Json login_account(Store& store, const Json& params, std::atomic<std::uint64_t>& revision) {
     const auto username = normalized_username(text_field(params, "username"));
     const auto password = text_field(params, "password");
     const auto device = id_field(params, "device_id");
@@ -305,6 +343,13 @@ Json login_account(Store& store, const Json& params) {
                            tokens.refresh_digest, tokens.now, tokens.access_expires,
                            tokens.refresh_expires);
     require(context);
+    require(ensure_defaults(store, account->id, account->username, account->display_name, name));
+    if (const auto notice_key = random_id()) {
+        const auto notice = make_system_payload(
+            "安全提醒", "设备「" + name + "」（" + encode_id(device).substr(0, 8) + "…）已登录你的账号。");
+        (void)store.append_system_notice(account->id, *notice_key, notice);
+    }
+    revision.fetch_add(1);
     return auth_response(*context, tokens);
 }
 
@@ -349,6 +394,17 @@ Json start_conversation(Store& store, const Principal& principal, const Json& pa
     if (!requested.is_array() || requested.json_size() == 0 || requested.json_size() > 8) {
         throw InvalidParams{};
     }
+    if (requested.json_size() == 1 && requested[0].is_string()) {
+        const auto single = parse_id(requested[0].as_string());
+        if (single && *single == session.account) {
+            const auto defaults = ensure_defaults(
+                store, session.account, principal.username,
+                principal.display_name.empty() ? principal.username : principal.display_name,
+                "当前设备");
+            require(defaults);
+            return summary_json(defaults->self_room);
+        }
+    }
     std::vector<Id> targets;
     for (std::size_t index = 0; index < requested.json_size(); ++index) {
         const auto value = requested[index];
@@ -390,6 +446,36 @@ Json start_conversation(Store& store, const Principal& principal, const Json& pa
     return summary_json(*summary);
 }
 
+Json list_contacts(Store& store, const Principal& principal, const Json& params) {
+    const auto& session = device_session(principal, params);
+    const auto contacts = store.list_contacts(session);
+    require(contacts);
+    Json entries = Json::array();
+    for (const auto& contact : *contacts) {
+        entries.push_back(profile_json(contact));
+    }
+    auto result = Json::object();
+    result["contacts"] = std::move(entries);
+    return result;
+}
+
+Json add_contact(Store& store, const Principal& principal, const Json& params) {
+    const auto& session = device_session(principal, params);
+    const auto target = id_field(params, "account_id");
+    const auto contact = store.add_contact(session, target, current_time());
+    require(contact);
+    auto result = Json::object();
+    result["contact"] = profile_json(*contact);
+    return result;
+}
+
+Json remove_contact(Store& store, const Principal& principal, const Json& params) {
+    const auto& session = device_session(principal, params);
+    const auto target = id_field(params, "account_id");
+    require(store.remove_contact(session, target));
+    return accepted();
+}
+
 Json list_account_devices(Store& store, const Principal& principal, const Json& params) {
     const auto& session = device_session(principal, params);
     const auto devices = store.list_devices(session);
@@ -412,7 +498,13 @@ Json list_account_devices(Store& store, const Principal& principal, const Json& 
 Json remove_account_device(Store& store, const Principal& principal, const Json& params,
                            std::atomic<std::uint64_t>& revision) {
     const auto& session = device_session(principal, params);
-    require(store.remove_device(session, id_field(params, "device_id")));
+    const auto target_device = id_field(params, "device_id");
+    require(store.remove_device(session, target_device));
+    if (const auto notice_key = random_id()) {
+        const auto notice = make_system_payload(
+            "设备已撤销", "设备 " + encode_id(target_device).substr(0, 8) + "… 已被撤销，无法继续访问会话。");
+        (void)store.append_system_notice(session.account, *notice_key, notice);
+    }
     revision.fetch_add(1);
     return accepted();
 }
@@ -516,10 +608,10 @@ Json dispatch(Store& store, const Config& config, const Principal& principal,
         throw InvalidParams{};
     }
     if (method == "account.register") {
-        return register_account(store, params);
+        return register_account(store, params, revision);
     }
     if (method == "account.login") {
-        return login_account(store, params);
+        return login_account(store, params, revision);
     }
     if (method == "account.refresh") {
         return refresh_account(store, params);
@@ -545,6 +637,15 @@ Json dispatch(Store& store, const Config& config, const Principal& principal,
     }
     if (method == "account.search") {
         return search_accounts(store, principal, params);
+    }
+    if (method == "contact.list") {
+        return list_contacts(store, principal, params);
+    }
+    if (method == "contact.add") {
+        return add_contact(store, principal, params);
+    }
+    if (method == "contact.remove") {
+        return remove_contact(store, principal, params);
     }
     if (method == "conversation.start") {
         return start_conversation(store, principal, params);
