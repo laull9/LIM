@@ -1,0 +1,209 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ─────────────────────────────────────────────
+   潮汐主题 / Tide design tokens
+   浅色 = 退潮 (low tide) · 深色 = 涨潮 (high tide)
+   ───────────────────────────────────────────── */
+:root {
+  --font-sans: "Manrope", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --radius: 0.875rem;
+
+  --background: #e9f0f1;
+  --foreground: #0e2233;
+  --card: #ffffff;
+  --card-foreground: #0e2233;
+  --popover: #ffffff;
+  --popover-foreground: #0e2233;
+  --primary: #0f8b8d;
+  --primary-foreground: #f4fbfb;
+  --secondary: #dbe7e8;
+  --secondary-foreground: #123a52;
+  --muted: #eef3f4;
+  --muted-foreground: #5c7382;
+  --accent: #d9eeee;
+  --accent-foreground: #0b5f6b;
+  --destructive: #e4573d;
+  --destructive-foreground: #ffffff;
+  --border: #d6e2e4;
+  --input: #d6e2e4;
+  --ring: #0f8b8d;
+
+  /* tide palette */
+  --deep: #0e2233;
+  --deep-2: #123a52;
+  --tide: #0f8b8d;
+  --tide-2: #0b5f6b;
+  --foam: #f4fbfb;
+  --sand: #e9dfcb;
+  --coral: #f26b4e;
+  --kelp: #2f9e6e;
+  --amber: #e9a23b;
+
+  --bubble-own: #0f8b8d;
+  --bubble-own-fg: #f4fbfb;
+  --bubble-other: #ffffff;
+  --bubble-other-fg: #0e2233;
+  --rail: #0e2233;
+  --rail-fg: #a9c3cf;
+  --chat-bg: #e9f0f1;
+
+  color-scheme: light;
+}
+
+.dark {
+  --background: #081623;
+  --foreground: #e6f0f2;
+  --card: #0e2233;
+  --card-foreground: #e6f0f2;
+  --popover: #0f2535;
+  --popover-foreground: #e6f0f2;
+  --primary: #2bb3b1;
+  --primary-foreground: #04191c;
+  --secondary: #163449;
+  --secondary-foreground: #d3e4ea;
+  --muted: #11293a;
+  --muted-foreground: #8aa5b3;
+  --accent: #133c47;
+  --accent-foreground: #9fe3e1;
+  --destructive: #f26b4e;
+  --destructive-foreground: #ffffff;
+  --border: #1b3a4d;
+  --input: #1b3a4d;
+  --ring: #2bb3b1;
+
+  --deep: #050f18;
+  --deep-2: #0e2233;
+  --tide: #2bb3b1;
+  --tide-2: #1a8c8e;
+  --foam: #e6f0f2;
+  --sand: #c9b995;
+  --coral: #ff7f63;
+  --kelp: #45b989;
+  --amber: #f0b254;
+
+  --bubble-own: #1a8c8e;
+  --bubble-own-fg: #f0fbfb;
+  --bubble-other: #122f42;
+  --bubble-other-fg: #e6f0f2;
+  --rail: #050f18;
+  --rail-fg: #7f9aa8;
+  --chat-bg: #0a1b2a;
+
+  color-scheme: dark;
+}
+
+@theme inline {
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-deep: var(--deep);
+  --color-deep-2: var(--deep-2);
+  --color-tide: var(--tide);
+  --color-tide-2: var(--tide-2);
+  --color-foam: var(--foam);
+  --color-sand: var(--sand);
+  --color-coral: var(--coral);
+  --color-kelp: var(--kelp);
+  --color-amber: var(--amber);
+  --color-rail: var(--rail);
+  --color-rail-fg: var(--rail-fg);
+  --color-chat-bg: var(--chat-bg);
+  --color-bubble-own: var(--bubble-own);
+  --color-bubble-own-fg: var(--bubble-own-fg);
+  --color-bubble-other: var(--bubble-other);
+  --color-bubble-other-fg: var(--bubble-other-fg);
+
+  --radius-sm: calc(var(--radius) - 6px);
+  --radius-md: calc(var(--radius) - 3px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 6px);
+  --radius-2xl: calc(var(--radius) + 12px);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+
+* {
+  border-color: var(--border);
+}
+
+::selection {
+  background: color-mix(in oklab, var(--tide) 30%, transparent);
+}
+
+:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+button:not(:disabled) {
+  cursor: pointer;
+}
+
+/* slim, flat scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklab, var(--foreground) 18%, transparent) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: color-mix(in oklab, var(--foreground) 18%, transparent);
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@keyframes tide-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

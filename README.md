@@ -46,6 +46,8 @@ xmake project -k compile_commands --lsp=clangd build/ide
 
 `lim-server` 使用 LTool 的 LWeb 和 LJson，通过 `--config FILE` 启动。依赖、设备和操作员凭据配置、方法表及请求示例见 [JSON-RPC 2.0](docs/rpc.md)。原始正文收发和低开销在线提示见 [二进制 HTTP](docs/protocol.md)。
 
+[LIM Web demo](web/README.md#启动双端-demo) 可连接现有服务，也可用临时 SQLite 数据库启动两个演示设备，在浏览器中双向收发。
+
 ## 首版 demo
 
 每条命令启动一个独立进程。Alice 和 Bob 是可信宿主中的两个演示身份，共用一个持久化会话。下面用新的 SQLite 文件演示双向收发、退出后的补齐和幂等重试。

@@ -1,0 +1,312 @@
+.app {
+  height: 100dvh;
+  display: flex;
+  overflow: hidden;
+  background: var(--background);
+}
+
+.main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 30px;
+  flex: none;
+  font-size: 12px;
+  font-weight: 800;
+  color: #fff;
+  background: var(--amber);
+  animation: tide-fade-in 0.2s ease both;
+}
+
+.banner i {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: #fff;
+  animation: pulse 1s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  padding: 8px 18px;
+  background: color-mix(in oklab, var(--amber) 18%, var(--card));
+  color: var(--amber);
+  font-size: 12px;
+  font-weight: 700;
+  border-bottom: 1px solid var(--border);
+}
+
+.notice > span {
+  color: var(--foreground);
+  font-weight: 600;
+}
+
+.notice button {
+  margin-left: auto;
+}
+
+/* ───────── 空态 ───────── */
+.empty {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 24px;
+  text-align: center;
+  background-color: var(--chat-bg);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='24' viewBox='0 0 120 24'%3E%3Cpath d='M0 12c10-8 20-8 30 0s20 8 30 0 20-8 30 0 20 8 30 0' fill='none' stroke='%230f8b8d' stroke-opacity='.07' stroke-width='1.5'/%3E%3C/svg%3E");
+  background-size: 120px 24px;
+}
+
+.emptyWaves {
+  width: 160px;
+  margin-bottom: 10px;
+}
+
+.empty h2 {
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+
+.empty p {
+  max-width: 30rem;
+  color: var(--muted-foreground);
+  font-size: 13.5px;
+  line-height: 1.7;
+}
+
+/* ───────── 入口 ───────── */
+.entry {
+  min-height: 100dvh;
+  display: grid;
+  grid-template-columns: minmax(0, 1.02fr) minmax(0, 1fr);
+}
+
+.entryAside {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 2rem;
+  padding: clamp(2rem, 5vw, 5.5rem);
+  overflow: hidden;
+  color: var(--foam);
+  background: var(--rail);
+}
+
+.entryAside::before {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  content: "";
+  background:
+    radial-gradient(circle at 76% 24%, color-mix(in oklab, var(--tide) 42%, transparent), transparent 62%),
+    radial-gradient(circle at 20% 88%, color-mix(in oklab, var(--tide-2) 55%, transparent), transparent 58%);
+}
+
+.waves {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 190px;
+  z-index: -1;
+  opacity: 0.85;
+  pointer-events: none;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.brand strong {
+  display: block;
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+}
+
+.brand small {
+  display: block;
+  margin-top: 1px;
+  color: var(--rail-fg);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.claim h1 {
+  margin-bottom: 18px;
+  font-size: clamp(2.4rem, 5.4vw, 4.6rem);
+  font-weight: 800;
+  line-height: 1.06;
+  letter-spacing: -0.055em;
+}
+
+.claim p {
+  max-width: 26rem;
+  color: var(--rail-fg);
+  font-size: 14px;
+  line-height: 1.75;
+}
+
+.caption {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--rail-fg);
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.entryContent {
+  display: grid;
+  place-items: center;
+  padding: clamp(1.5rem, 4vw, 3rem);
+  background: var(--background);
+}
+
+.login {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(100%, 25rem);
+  padding: clamp(1.5rem, 3vw, 2.4rem);
+  border: 1px solid var(--border);
+  border-radius: 22px;
+  background: var(--card);
+  box-shadow: 0 18px 46px rgb(14 34 51 / 0.14);
+}
+
+.loginIcon {
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  margin-bottom: 4px;
+  border-radius: 16px;
+  background: var(--accent);
+  color: var(--accent-foreground);
+}
+
+.login h2 {
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+}
+
+.login p {
+  color: var(--muted-foreground);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.login label {
+  margin: 4px 0 -4px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.token {
+  position: relative;
+}
+
+.token input {
+  padding-right: 3rem;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.token button {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  color: var(--muted-foreground);
+}
+
+.login p.error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--destructive);
+  font-weight: 600;
+}
+
+.note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+
+@media (max-width: 900px) {
+  .entry {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .entryAside {
+    gap: 1.25rem;
+    padding: 1.6rem 1.4rem 2.4rem;
+  }
+
+  .claim h1 {
+    margin-bottom: 8px;
+    font-size: clamp(1.9rem, 8vw, 2.6rem);
+  }
+
+  .claim h1 br,
+  .claim p,
+  .caption {
+    display: none;
+  }
+
+  .waves {
+    height: 110px;
+  }
+
+  .entryContent {
+    flex: 1;
+    place-items: start center;
+    padding: 1.4rem;
+  }
+}
+
+/* ───────── 窄屏：目录与对话二选一 ───────── */
+.sidebarSlot {
+  display: contents;
+}
+
+@media (max-width: 768px) {
+  .app[data-room-open="true"] .sidebarSlot {
+    display: none;
+  }
+}
