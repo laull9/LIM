@@ -23,7 +23,7 @@ async function fillForward(connection: RoomConnection, signal: AbortSignal) {
     if (upTo !== undefined && BigInt(cursor.after) >= BigInt(upTo)) return
     const page = await client.events(identity.generation, conversation.conversation_id, cursor.after, upTo, signal)
     signal.throwIfAborted()
-    const saved = await saveEvents(room, identity.device, cursor, page.events, page.next_after, 'forward')
+    const saved = await saveEvents(room, cursor, page.events, page.next_after, 'forward')
     if (saved && page.next_after === page.up_to) return
     upTo = page.up_to
   }
@@ -81,7 +81,7 @@ export async function loadOlder(connection: RoomConnection, signal: AbortSignal)
       after = page.next_after
     }
     signal.throwIfAborted()
-    await saveEvents(room, identity.device, cursor, events, boundary, 'backward')
+    await saveEvents(room, cursor, events, boundary, 'backward')
   } catch (error) {
     if (!signal.aborted && error instanceof LimError && error.kind === 'cursor_expired' && error.sequence) {
       await setFloor(room, error.sequence)

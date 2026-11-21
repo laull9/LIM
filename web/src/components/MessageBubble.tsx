@@ -1,8 +1,9 @@
-import { Check, Clock3, Copy, TriangleAlert } from 'lucide-react'
+import { Check, Clock3, Copy, RotateCcw, TriangleAlert } from 'lucide-react'
 import { memo, useState } from 'react'
 import styles from './Message.module.css'
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip'
-import { deviceLabel, roomColor } from '../chat/naming'
+import { deviceLabel, roomColor, senderLabel } from '../chat/naming'
+import { useChat } from '../chat/chat-context'
 import type { Item } from '../chat/chat-context'
 
 const META = /(@[\u4e00-\u9fa5A-Za-z]+|https?:\/\/\S+)/g
@@ -26,7 +27,7 @@ function RichText({ text }: { text: string }) {
   )
 }
 
-function DeviceBadge({ id }: { id: string }) {
+function SenderBadge({ id }: { id: string }) {
   return (
     <span
       className="grid size-[34px] shrink-0 place-items-center rounded-full text-[11px] font-extrabold text-white select-none"
@@ -38,16 +39,18 @@ function DeviceBadge({ id }: { id: string }) {
   )
 }
 
-export const MessageBubble = memo(function MessageBubble({ item, device, first, last }: {
+export const MessageBubble = memo(function MessageBubble({ item, device, account, first, last }: {
   item: Item
   device: string
+  account: string
   first: boolean
   last: boolean
 }) {
+  const { retryMessage } = useChat()
   const [copied, setCopied] = useState(false)
   const pending = 'status' in item
-  const own = pending || item.device === device
-  const sender = pending ? device : item.device
+  const own = pending || (item.account ? item.account === account : item.device === device)
+  const sender = pending ? device : (item.account ?? item.device)
   const json = !pending && item.type === 'application/json'
 
   async function copy() {
@@ -63,14 +66,14 @@ export const MessageBubble = memo(function MessageBubble({ item, device, first, 
   return (
     <div className={styles.row} data-own={own} data-first={first} data-last={last}>
       <div className={styles.avatarSlot}>
-        {!own && last && <DeviceBadge id={sender} />}
+        {!own && last && <SenderBadge id={sender} />}
       </div>
 
       <div className={styles.body}>
         {!own && first && (
           <div className={styles.sender} style={{ color: roomColor(sender) }}>
-            {deviceLabel(sender)}
-            {sender === device && <span className="text-[11px] font-semibold text-muted-foreground">本机</span>}
+            {pending ? deviceLabel(sender) : senderLabel(item)}
+            {!pending && item.device === device && <span className="text-[11px] font-semibold text-muted-foreground">本机</span>}
           </div>
         )}
 
@@ -88,6 +91,12 @@ export const MessageBubble = memo(function MessageBubble({ item, device, first, 
                 <span data-failed={item.status === 'failed'}>
                   {item.status === 'accepted' ? '已发送' : item.status === 'failed' ? item.issue ?? '发送失败' : '等待发送'}
                 </span>
+                {item.status === 'failed' && (
+                  <button type="button" className="ml-1 inline-flex items-center gap-1 font-bold text-tide"
+                    onClick={() => void retryMessage(item.id)}>
+                    <RotateCcw size={11} aria-hidden="true" /> 重试
+                  </button>
+                )}
               </>
             ) : (
               <span>#{item.seq}</span>

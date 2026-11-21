@@ -1,19 +1,24 @@
 module;
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include <LJson.hpp>
 #include <LString.hpp>
 
 export module lim.server.rpc;
+import lim.server.auth;
 import lim.server.config;
 import lim.server.contract;
 import lim.storage;
@@ -34,9 +39,10 @@ namespace {
 constexpr std::size_t kBatchLimit = 16;
 constexpr std::size_t kRpcResponseBytes = 2 * 1024 * 1024;
 constexpr std::size_t kEnvelopeBytes = 1024;
-// Fixed keys, two UUIDs, the sequence and the content type fit this allowance.
 constexpr std::size_t kEventMetadataBytes = 256;
 constexpr std::size_t kMaxEncodedPayload = 4 * ((kMessageBytes + 2) / 3);
+constexpr Sequence kAccessLifetime = 15 * 60;
+constexpr Sequence kRefreshLifetime = 30 * 24 * 60 * 60;
 
 static_assert((kRpcResponseBytes - kRpcRequestBytes) / kBatchLimit >
               kMaxEncodedPayload + kEnvelopeBytes * 2);
@@ -98,6 +104,81 @@ std::string decode_base64(std::string_view encoded) {
     return bytes;
 }
 
+std::string_view trim(std::string_view input) {
+    while (!input.empty() && (input.front() == ' ' || input.front() == '\t')) {
+        input.remove_prefix(1);
+    }
+    while (!input.empty() && (input.back() == ' ' || input.back() == '\t')) {
+        input.remove_suffix(1);
+    }
+    return input;
+}
+
+std::string device_name_field(const Json& params) {
+    const auto raw = text_field(params, "device_name");
+    const auto value = trim(raw);
+    if (value.empty() || value.size() > 64 || !LString::valid_utf8(value)) {
+        throw InvalidParams{};
+    }
+    return std::string(value);
+}
+
+std::string search_prefix(std::string_view input) {
+    const auto value = trim(input);
+    if (value.empty() || value.size() > 24) {
+        throw InvalidParams{};
+    }
+    std::string result;
+    for (const char raw : value) {
+        const auto byte = static_cast<unsigned char>(raw);
+        if (byte >= 'A' && byte <= 'Z') {
+            result.push_back(static_cast<char>(byte + ('a' - 'A')));
+        } else if ((byte >= 'a' && byte <= 'z') || (byte >= '0' && byte <= '9') || byte == '_') {
+            result.push_back(static_cast<char>(byte));
+        } else {
+            throw InvalidParams{};
+        }
+    }
+    return result;
+}
+
+struct TokenPair {
+    std::string access;
+    std::string refresh;
+    SecretDigest access_digest;
+    SecretDigest refresh_digest;
+    Sequence now;
+    Sequence access_expires;
+    Sequence refresh_expires;
+};
+
+TokenPair make_tokens() {
+    const auto access = random_token();
+    const auto refresh = random_token();
+    const auto access_digest = access ? secret_digest(*access) : std::nullopt;
+    const auto refresh_digest = refresh ? secret_digest(*refresh) : std::nullopt;
+    if (!access || !refresh || !access_digest || !refresh_digest) {
+        throw std::runtime_error("cannot create authentication tokens");
+    }
+    const auto now = current_time();
+    return TokenPair{*access, *refresh, *access_digest, *refresh_digest, now,
+                     now + kAccessLifetime, now + kRefreshLifetime};
+}
+
+Json auth_response(const AuthContext& context, const TokenPair& tokens) {
+    auto result = Json::object();
+    result["generation"] = encode_id(context.session.generation);
+    result["account"] = encode_id(context.session.account);
+    result["device"] = encode_id(context.session.device);
+    result["username"] = context.username;
+    result["display_name"] = context.display_name;
+    result["access_token"] = tokens.access;
+    result["refresh_token"] = tokens.refresh;
+    result["access_expires_at"] = tokens.access_expires;
+    result["refresh_expires_at"] = tokens.refresh_expires;
+    return result;
+}
+
 struct RpcError {
     int code;
     std::string_view message;
@@ -143,6 +224,197 @@ void require_operator(const Principal& principal) {
     if (!principal.is_operator) {
         throw RpcError{-32003, "Operator authorization required"};
     }
+}
+
+Json profile_json(const AccountProfile& profile) {
+    auto result = Json::object();
+    result["account"] = encode_id(profile.id);
+    result["username"] = profile.username;
+    result["display_name"] = profile.display_name;
+    return result;
+}
+
+Json summary_json(const ConversationSummary& summary) {
+    auto result = Json::object();
+    result["conversation_id"] = encode_id(summary.id);
+    result["after"] = std::to_string(summary.after);
+    result["last_seq"] = std::to_string(summary.last_seq);
+    result["profile"] = "host";
+    if (summary.account_scoped) {
+        result["kind"] = summary.kind;
+        result["title"] = summary.title;
+        Json members = Json::array();
+        for (const auto& member : summary.members) {
+            members.push_back(profile_json(member));
+        }
+        result["members"] = std::move(members);
+    }
+    return result;
+}
+
+Json register_account(Store& store, const Json& params) {
+    const auto username = normalized_username(text_field(params, "username"));
+    const auto raw_display_name = text_field(params, "display_name");
+    const auto display_name = trim(raw_display_name);
+    const auto password = text_field(params, "password");
+    const auto device = id_field(params, "device_id");
+    const auto name = device_name_field(params);
+    if (!username || !valid_display_name(display_name)) {
+        throw InvalidParams{};
+    }
+    const auto hash = hash_password(password);
+    if (!hash) {
+        throw InvalidParams{};
+    }
+    const auto account = random_id();
+    const auto credential = random_id();
+    const auto login = random_id();
+    if (!account || !credential || !login) {
+        throw std::runtime_error("cannot create account identifiers");
+    }
+    require(store.create_account(*account, *username, display_name, *hash));
+    const auto tokens = make_tokens();
+    const auto context =
+        store.create_login(*login, *account, device, name, *credential, tokens.access_digest,
+                           tokens.refresh_digest, tokens.now, tokens.access_expires,
+                           tokens.refresh_expires);
+    require(context);
+    return auth_response(*context, tokens);
+}
+
+Json login_account(Store& store, const Json& params) {
+    const auto username = normalized_username(text_field(params, "username"));
+    const auto password = text_field(params, "password");
+    const auto device = id_field(params, "device_id");
+    const auto name = device_name_field(params);
+    if (!username) {
+        throw InvalidParams{};
+    }
+    const auto account = store.account_by_username(*username);
+    if (!account || !verify_password(password, account->password_hash)) {
+        throw from_failure(Failure{Error::Unauthenticated, std::nullopt});
+    }
+    const auto credential = random_id();
+    const auto login = random_id();
+    if (!credential || !login) {
+        throw std::runtime_error("cannot create login identifiers");
+    }
+    const auto tokens = make_tokens();
+    const auto context =
+        store.create_login(*login, account->id, device, name, *credential, tokens.access_digest,
+                           tokens.refresh_digest, tokens.now, tokens.access_expires,
+                           tokens.refresh_expires);
+    require(context);
+    return auth_response(*context, tokens);
+}
+
+Json refresh_account(Store& store, const Json& params) {
+    const auto old_refresh = secret_digest(text_field(params, "refresh_token"));
+    if (!old_refresh) {
+        throw InvalidParams{};
+    }
+    const auto tokens = make_tokens();
+    const auto context = store.rotate_login(*old_refresh, tokens.access_digest,
+                                            tokens.refresh_digest, tokens.now,
+                                            tokens.access_expires, tokens.refresh_expires);
+    require(context);
+    return auth_response(*context, tokens);
+}
+
+Json logout_account(Store& store, const Principal& principal) {
+    if (!principal.account_session || !principal.login || !principal.session) {
+        throw RpcError{-32001, "Device authentication required"};
+    }
+    require(store.logout(*principal.login, principal.session->account));
+    return accepted();
+}
+
+Json search_accounts(Store& store, const Principal& principal, const Json& params) {
+    const auto& session = device_session(principal, params);
+    const auto prefix = search_prefix(text_field(params, "query"));
+    const auto accounts = store.search_accounts(session, prefix, 20);
+    require(accounts);
+    Json users = Json::array();
+    for (const auto& account : *accounts) {
+        users.push_back(profile_json(account));
+    }
+    auto result = Json::object();
+    result["users"] = std::move(users);
+    return result;
+}
+
+Json start_conversation(Store& store, const Principal& principal, const Json& params) {
+    const auto& session = device_session(principal, params);
+    const auto requested = field(params, "account_ids");
+    if (!requested.is_array() || requested.json_size() == 0 || requested.json_size() > 8) {
+        throw InvalidParams{};
+    }
+    std::vector<Id> targets;
+    for (std::size_t index = 0; index < requested.json_size(); ++index) {
+        const auto value = requested[index];
+        if (!value.is_string()) {
+            throw InvalidParams{};
+        }
+        const auto id = parse_id(value.as_string());
+        if (!id || *id == Id{} || *id == session.account ||
+            std::ranges::find(targets, *id) != targets.end()) {
+            throw InvalidParams{};
+        }
+        targets.push_back(*id);
+    }
+    std::string title;
+    if (params.contains("title")) {
+        title = std::string(trim(text_field(params, "title")));
+        if (title.empty() || title.size() > 64 || !LString::valid_utf8(title)) {
+            throw InvalidParams{};
+        }
+    }
+    const auto direct = targets.size() == 1;
+    if (!direct && title.empty()) {
+        throw InvalidParams{};
+    }
+    const auto conversation = random_id();
+    if (!conversation) {
+        throw std::runtime_error("cannot create conversation identifier");
+    }
+    std::string direct_key;
+    if (direct) {
+        const auto self_key = encode_id(session.account);
+        const auto target_key = encode_id(targets.front());
+        const auto ordered = std::minmax(self_key, target_key);
+        direct_key = ordered.first + ":" + ordered.second;
+    }
+    const auto summary = store.start_conversation(
+        session, *conversation, targets, direct ? "direct" : "group", title, direct_key);
+    require(summary);
+    return summary_json(*summary);
+}
+
+Json list_account_devices(Store& store, const Principal& principal, const Json& params) {
+    const auto& session = device_session(principal, params);
+    const auto devices = store.list_devices(session);
+    require(devices);
+    Json entries = Json::array();
+    for (const auto& device : *devices) {
+        auto entry = Json::object();
+        entry["device_id"] = encode_id(device.id);
+        entry["name"] = device.name;
+        entry["created_at"] = device.created_at;
+        entry["last_seen"] = device.last_seen;
+        entry["revoked"] = device.revoked;
+        entries.push_back(std::move(entry));
+    }
+    auto result = Json::object();
+    result["devices"] = std::move(entries);
+    return result;
+}
+
+Json remove_account_device(Store& store, const Principal& principal, const Json& params,
+                           std::atomic<std::uint64_t>& revision) {
+    const auto& session = device_session(principal, params);
+    require(store.remove_device(session, id_field(params, "device_id")));
+    revision.fetch_add(1);
+    return accepted();
 }
 
 Json send_message(Store& store, const Principal& principal, const Json& params,
@@ -198,6 +470,9 @@ Json read_events(Store& store, const Principal& principal, const Json& params, s
         auto item = Json::object();
         item["seq"] = std::to_string(event.seq);
         item["device_id"] = encode_id(event.sender_device);
+        item["account_id"] = encode_id(event.sender_account);
+        item["username"] = event.username;
+        item["display_name"] = event.display_name;
         item["client_message_id"] = encode_id(event.client_message_id);
         const auto type = content_type(event.format);
         if (type.empty()) {
@@ -223,12 +498,7 @@ Json list_conversations(Store& store, const Principal& principal, const Json& pa
     require(page);
     Json entries = Json::array();
     for (const auto& item : page->conversations) {
-        auto entry = Json::object();
-        entry["conversation_id"] = encode_id(item.id);
-        entry["after"] = std::to_string(item.after);
-        entry["last_seq"] = std::to_string(item.last_seq);
-        entry["profile"] = "host";
-        entries.push_back(std::move(entry));
+        entries.push_back(summary_json(item));
     }
     auto result = Json::object();
     result["conversations"] = std::move(entries);
@@ -245,6 +515,18 @@ Json dispatch(Store& store, const Config& config, const Principal& principal,
     if (!params.is_object()) {
         throw InvalidParams{};
     }
+    if (method == "account.register") {
+        return register_account(store, params);
+    }
+    if (method == "account.login") {
+        return login_account(store, params);
+    }
+    if (method == "account.refresh") {
+        return refresh_account(store, params);
+    }
+    if (method == "account.logout") {
+        return logout_account(store, principal);
+    }
     if (method == "session.info") {
         if (!principal.session) {
             throw RpcError{-32001, "Device authentication required"};
@@ -255,7 +537,23 @@ Json dispatch(Store& store, const Config& config, const Principal& principal,
         result["generation"] = encode_id(session.generation);
         result["account"] = encode_id(session.account);
         result["device"] = encode_id(session.device);
+        if (principal.account_session) {
+            result["username"] = principal.username;
+            result["display_name"] = principal.display_name;
+        }
         return result;
+    }
+    if (method == "account.search") {
+        return search_accounts(store, principal, params);
+    }
+    if (method == "conversation.start") {
+        return start_conversation(store, principal, params);
+    }
+    if (method == "device.list") {
+        return list_account_devices(store, principal, params);
+    }
+    if (method == "device.remove") {
+        return remove_account_device(store, principal, params, revision);
     }
     if (method == "conversation.list") {
         return list_conversations(store, principal, params);
@@ -367,7 +665,7 @@ std::optional<std::string> handle_rpc(Store& store, const Config& config, std::s
     if (!request) {
         return error_response(nullptr, {-32700, "Parse error"}).dump();
     }
-    const auto principal = authenticate(config, token);
+    const auto principal = authenticate(store, config, token);
     if (!request->is_array()) {
         const auto response =
             handle_request(store, config, principal, *request,

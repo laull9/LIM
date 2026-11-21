@@ -71,6 +71,9 @@ class SqliteRows final : public Rows {
             const auto index = sqlite3_bind_parameter_index(stmt_.get(), name.c_str());
             if (const auto* number = std::get_if<std::int64_t>(&parameter)) {
                 check(sqlite3_bind_int64(stmt_.get(), index, *number));
+            } else if (const auto* text = std::get_if<std::string_view>(&parameter)) {
+                check(sqlite3_bind_text64(stmt_.get(), index, text->data(), text->size(),
+                                          SQLITE_TRANSIENT, SQLITE_UTF8));
             } else {
                 const auto bytes = std::get<Bytes>(parameter);
                 check(sqlite3_bind_blob64(stmt_.get(), index, bytes.data(), bytes.size(),
@@ -99,6 +102,13 @@ class SqliteRows final : public Rows {
             static_cast<const std::byte*>(sqlite3_column_blob(stmt_.get(), column));
         const auto size = sqlite3_column_bytes(stmt_.get(), column);
         return {contents, static_cast<std::size_t>(size)};
+    }
+
+    std::string_view text(int column) const override {
+        const auto* contents =
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt_.get(), column));
+        const auto size = sqlite3_column_bytes(stmt_.get(), column);
+        return size == 0 ? std::string_view{} : std::string_view(contents, size);
     }
 
   private:

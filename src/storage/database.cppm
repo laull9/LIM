@@ -6,6 +6,7 @@ module;
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <variant>
 
 module lim.storage:database;
@@ -13,7 +14,7 @@ module lim.storage:database;
 namespace lim::storage_detail {
 
 using Bytes = std::span<const std::byte>;
-using Parameter = std::variant<std::int64_t, Bytes>;
+using Parameter = std::variant<std::int64_t, Bytes, std::string_view>;
 
 struct DatabaseError {
     bool busy = false;
@@ -24,8 +25,9 @@ class Rows {
     virtual ~Rows() = default;
     virtual bool next() = 0;
     virtual std::int64_t integer(int column) const = 0;
-    // The view is valid until the row advances or is destroyed. NULL gives an empty view.
+    // The views are valid until the row advances or is destroyed. NULL is empty.
     virtual Bytes bytes(int column) const = 0;
+    virtual std::string_view text(int column) const = 0;
 };
 
 enum class TransactionMode { Read, Write, Migration };

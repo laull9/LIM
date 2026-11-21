@@ -2,11 +2,11 @@
 
 独立服务在 `127.0.0.1` 监听 HTTP，`POST /rpc` 接受 `application/json`。远程访问由同机 TLS 反向代理终止连接。代理向 LIM 转发带单一 `Content-Length` 的请求，配置连接数与请求速率限制。
 
-服务使用 [JSON-RPC 2.0](https://www.jsonrpc.org/specification) 的请求和响应对象、关联 ID、通知与批处理。业务方法接受命名参数对象。常规响应使用 HTTP 200。合法通知执行操作但省略 RPC 响应，整批只有通知时返回 HTTP 204。批处理按提交次序执行，每次调用独立提交。HTTP 层拒绝不支持的方法和内容类型。
+服务使用 [JSON-RPC 2.0](https://www.jsonrpc.org/specification) 的请求和响应对象、关联 ID、通知与批处理。业务方法接受命名参数对象。常规响应使用 HTTP 200。合法通知执行操作但省略 RPC 响应，整批只有通知时返回 HTTP 204。批处理按提交次序执行，每次调用独立提交；凭据在批次开始时解析一次，因此不要把 logout 与依赖该凭据的后续调用放进同一批次。HTTP 层拒绝不支持的方法和内容类型。
 
 ## 启动
 
-先初始化仓库固定版本的 LTool 子模块。除 SQLite 和 libpq 外，服务需要 pkg-config 可识别的 OpenSSL 3.0+ `libcrypto`。HTTP 使用 LTool 的 LWeb 和它自带的 standalone Asio，JSON 使用 LJson，二进制转换使用 LString。OpenSSL 用于令牌摘要和常量时间比较。
+先初始化仓库固定版本的 LTool 子模块。除 SQLite 和 libpq 外，服务需要 pkg-config 可识别的 OpenSSL 3.0+ `libcrypto`。HTTP 使用 LTool 的 LWeb 和它自带的 standalone Asio，JSON 使用 LJson，二进制转换使用 LString。OpenSSL 用于 CSPRNG、scrypt 密码哈希、令牌摘要和常量时间比较。
 
 ```sh
 git submodule update --init inc/ltool
@@ -14,7 +14,7 @@ xmake build lim-server
 xmake run lim-server --config /absolute/path/lim.json
 ```
 
-配置包含恢复代次、存储、管理凭据摘要及设备列表。生成令牌时使用 32 字节密码学随机量，编码为 64 位小写十六进制。`*_sha256` 是该 **ASCII 字符串**的 SHA-256，小写十六进制。用 `Authorization: Bearer <token>` 传令牌。管理令牌和设备令牌相互独立，服务端配置只保存摘要。设备 `credential` 是内部 UUID，与数据库绑定，轮换令牌时保留该 UUID。启动时登记配置中的设备，数据库中撤销的设备重启后仍保持撤销。
+配置包含恢复代次、存储、管理凭据摘要及可选的静态设备列表。`devices` 可以为 `[]`，普通账号通过 `account.register` / `account.login` 创建并自动登记设备。生成静态令牌时使用 32 字节密码学随机量，编码为 64 位小写十六进制。`*_sha256` 是该 **ASCII 字符串**的 SHA-256，小写十六进制。用 `Authorization: Bearer <token>` 传令牌。静态令牌只用于操作员和受控集成；账号版使用数据库签发的短期访问令牌与轮换刷新令牌，服务端只保存摘要。设备 `credential` 是内部 UUID，与数据库绑定，轮换静态令牌时保留该 UUID。启动时登记配置中的设备，数据库中撤销的设备重启后仍保持撤销。
 
 ```json
 {
@@ -37,18 +37,28 @@ SQLite 路径以配置文件所在目录为基准。PostgreSQL 改用 `{"backend
 
 ## 调用
 
-除 `session.info` 外，所有方法均要求 `generation`。UUID 使用带连字符的小写文本，序号为无前导零的十进制字符串。先用操作员令牌创建 `host` 会话并添加设备，然后从设备客户端收发。
+账号版客户端先调用公共方法完成注册或登录，用返回的 `access_token` 发起其余请求；访问令牌 15 分钟有效，`refresh_token` 30 天有效并在每次续期时轮换。`account.register`、`account.login` 和 `account.refresh` 不需要 Authorization 头。登录参数中的 `device_id` 是客户端持久保存的稳定 UUID；同账号、同设备 ID 重复登录不会生成第二台设备。除 `session.info`、公共账号方法和 `account.logout` 外，业务方法均要求 `generation`。UUID 使用带连字符的小写文本，序号为无前导零的十进制字符串。操作员令牌与静态设备令牌路径保留兼容，但不作为普通用户入口。
 
-| 方法 | 凭据 | 业务参数 |
+| 方法 | 凭据 | 业务参数与行为 |
 | --- | --- | --- |
-| `session.info` | 设备 | 无，返回 `generation`、`account`、`device` |
-| `conversation.create` | 操作员 | `conversation_id`、`profile: "host"` |
-| `conversation.set_member` | 操作员 | `conversation_id`、`device_id`、布尔值 `active` |
-| `conversation.list` | 设备 | 可选会话 UUID `after`，逐页返回成员可读下界、会话高水位和 `next_after` |
+| `account.register` | 公共 | `username`、`password`、`display_name`、`device_id`、`device_name`；创建账号和登录会话 |
+| `account.login` | 公共 | `username`、`password`、`device_id`、`device_name`；复用现有设备或登记新设备 |
+| `account.refresh` | 公共 | `refresh_token`；原子轮换访问和刷新令牌，旧刷新令牌立即失效 |
+| `account.logout` | 账号访问令牌 | 无；吊销当前登录会话 |
+| `account.search` | 设备 | `query`，用户名前缀搜索，最多 20 个账号 |
+| `conversation.start` | 设备 | `account_ids` 和可选群 `title`；一个目标创建去重私聊，多个目标创建小群，成员按账号授权 |
+| `device.list` | 设备 | 无；列出当前账号的设备名称、时间和撤销状态 |
+| `device.remove` | 设备 | `device_id`；撤销当前账号的一台设备及其登录会话，不删除账号级成员 |
+| `session.info` | 设备 | 无，返回 `generation`、`account`、`device`；账号会话另返回用户名和昵称 |
+| `conversation.create` | 操作员 | `conversation_id`、`profile: "host"`，兼容旧宿主集成 |
+| `conversation.set_member` | 操作员 | `conversation_id`、`device_id`、布尔值 `active`，兼容旧设备级成员 |
+| `conversation.list` | 设备 | 可选会话 UUID `after`，逐页返回成员可读下界、会话高水位和 `next_after`；账号会话另返回 `kind`、`title`、`members` |
 | `message.send` | 设备 | `conversation_id`、`client_message_id`、`content_type`、正文 |
-| `conversation.events` | 设备 | `conversation_id`、排除下界 `after`、可选固定上界 `up_to` |
+| `conversation.events` | 设备 | `conversation_id`、排除下界 `after`、可选固定上界 `up_to`；事件包含 `account_id`、`username`、`display_name` |
 | `conversation.expire` | 操作员 | `conversation_id`、`through`，清理截至该序号的正文并保留幂等键 |
-| `device.revoke` | 操作员 | `device_id`，撤销设备并移除其成员资格 |
+| `device.revoke` | 操作员 | `device_id`，撤销静态设备并移除其设备级成员资格 |
+
+`account.register` 和登录成功返回 `generation`、`account`、`device`、`username`、`display_name`、`access_token`、`refresh_token` 以及两个 Unix 秒级过期时间。用户名规范化为 3–24 位 `[a-z0-9_]`，密码 8–128 字节，昵称 1–48 字节有效 UTF-8。密码哈希使用 OpenSSL `EVP_PBE_scrypt`，参数 `N=32768,r=8,p=1,maxmem=64MiB`，随机 16 字节盐和 32 字节输出。E2EE 仍未实现，所有会话均为 `host`，服务端可读取正文。
 
 ```json
 {"jsonrpc":"2.0","id":"send-1","method":"message.send","params":{

@@ -20,6 +20,7 @@ module;
 #include <openssl/evp.h>
 
 export module lim.server.config;
+import lim.server.auth;
 import lim.storage;
 
 export namespace lim::server {
@@ -41,8 +42,12 @@ struct Config {
 };
 
 struct Principal {
-    const Session* session = nullptr;
+    std::optional<Session> session;
     bool is_operator = false;
+    std::optional<Id> login;
+    std::string username;
+    std::string display_name;
+    bool account_session = false;
 };
 
 [[nodiscard]] std::optional<Json> parse_json(std::string_view input);
@@ -50,6 +55,7 @@ struct Principal {
 [[nodiscard]] std::string encode_id(Id id);
 [[nodiscard]] Config load_config(const std::filesystem::path& path);
 [[nodiscard]] Principal authenticate(const Config& config, std::string_view token);
+[[nodiscard]] Principal authenticate(Store& store, const Config& config, std::string_view token);
 
 } // namespace lim::server
 
@@ -141,8 +147,6 @@ bool valid_tree(yyjson_val* node, std::size_t depth) {
 } // namespace
 
 std::optional<Json> parse_json(std::string_view input) {
-    // LJson uses yyjson. Inspect its read-only tree here because the DOM does
-    // not expose object-key iteration, and reject duplicate keys before copying.
     std::unique_ptr<yyjson_doc, FreeJson> parsed(yyjson_read(input.data(), input.size(), 0));
     if (!parsed || !valid_tree(yyjson_doc_get_root(parsed.get()), 0)) {
         return std::nullopt;
@@ -214,7 +218,7 @@ Config load_config(const std::filesystem::path& path) {
     const auto backend = string_field(storage, "backend");
     if (backend == "sqlite") {
         const auto name = string_field(storage, "file");
-        if (name.empty() || name == ":memory:" || name.find('\0') != name.npos) {
+        if (name.empty() || name == ":memory:" || name.find('\0') != std::string::npos) {
             throw std::runtime_error("SQLite file must be a persistent path");
         }
         config.storage = SqliteOptions{path.parent_path() / std::filesystem::path(name)};
@@ -267,9 +271,30 @@ Principal authenticate(const Config& config, std::string_view token) {
         CRYPTO_memcmp(digest.data(), config.operator_digest.data(), digest.size()) == 0;
     for (const auto& device : config.devices) {
         if (CRYPTO_memcmp(digest.data(), device.token_digest.data(), digest.size()) == 0) {
-            principal.session = &device.session;
+            principal.session = device.session;
         }
     }
+    return principal;
+}
+
+Principal authenticate(Store& store, const Config& config, std::string_view token) {
+    auto principal = authenticate(config, token);
+    if (principal.is_operator || principal.session) {
+        return principal;
+    }
+    const auto digest = secret_digest(token);
+    if (!digest) {
+        return {};
+    }
+    const auto context = store.access_session(*digest, current_time());
+    if (!context) {
+        return {};
+    }
+    principal.session = context->session;
+    principal.login = context->login;
+    principal.username = context->username;
+    principal.display_name = context->display_name;
+    principal.account_session = true;
     return principal;
 }
 

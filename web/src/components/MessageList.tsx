@@ -55,7 +55,7 @@ function EmptyPlaceholder() {
       </svg>
       <h3 className="text-base font-extrabold">新的潮汐，从这里开始</h3>
       <p className="mt-1 max-w-xs text-sm leading-relaxed text-muted-foreground">
-        发送第一条消息。它会被写入服务端，其他绑定了此会话的设备都能看到。
+        发送第一条消息。断网时它也会留在本机，联网后按原键继续投递。
       </p>
     </div>
   )
@@ -63,8 +63,17 @@ function EmptyPlaceholder() {
 
 const COMPONENTS = { Header: ListHeader, Footer: ListFooter, EmptyPlaceholder }
 
+const itemKey = (value?: Item) => {
+  if (!value) return undefined
+  if (!('device' in value)) return 'pending'
+  return value.account ? `a:${value.account}` : `d:${value.device}`
+}
+
 export function MessageList() {
-  const { items, prepended, canLoadOlder, olderBusy, loadOlderMessages, identity, verified } = useChat()
+  const {
+    items, prepended, canLoadOlder, olderBusy, loadOlderMessages, identity,
+    timelineReady, status,
+  } = useChat()
   const virtuoso = useRef<VirtuosoHandle>(null)
   const [atBottom, setAtBottom] = useState(true)
 
@@ -79,7 +88,12 @@ export function MessageList() {
 
   return (
     <div className={styles.canvas}>
-      {verified ? (
+      {status.state === 'offline' && (
+        <div className="pointer-events-none absolute left-1/2 top-2 z-10 -translate-x-1/2 rounded-full border border-border bg-card/90 px-3 py-1 text-[11px] font-bold text-muted-foreground shadow-sm">
+          离线 · 正在显示本机缓存
+        </div>
+      )}
+      {timelineReady ? (
         <Virtuoso<Item, ListContext>
           ref={virtuoso}
           className="absolute inset-0"
@@ -92,26 +106,27 @@ export function MessageList() {
           atBottomThreshold={THRESHOLD}
           alignToBottom
           increaseViewportBy={{ top: 600, bottom: 300 }}
-          computeItemKey={(_index, item) => `${'device' in item ? item.device : 'pending'}:${item.id}`}
+          computeItemKey={(_index, item) => `${itemKey(item)}:${item.id}`}
           components={COMPONENTS}
           itemContent={(index, item) => {
             const position = index - (START - prepended)
             const prev = items[position - 1]
             const next = items[position + 1]
-            const key = (value?: Item) => (value ? ('device' in value ? `d:${value.device}` : 'pending') : undefined)
-            const first = key(prev) !== key(item)
-            const last = key(next) !== key(item)
-            return <MessageBubble item={item} device={identity.device} first={first} last={last} />
+            const key = itemKey(item)
+            const first = itemKey(prev) !== key
+            const last = itemKey(next) !== key
+            return <MessageBubble item={item} device={identity.device}
+              account={identity.account} first={first} last={last} />
           }}
         />
       ) : (
         <div className="flex h-full flex-col items-center justify-center gap-3 text-muted-foreground">
           <WaveLine className="w-24 text-tide" />
-          <p className="text-xs font-bold" role="status">正在同步消息…</p>
+          <p className="text-xs font-bold" role="status">正在读取本机消息…</p>
         </div>
       )}
 
-      {!atBottom && (
+      {!atBottom && timelineReady && (
         <button
           className={styles.toBottom}
           onClick={() => virtuoso.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'smooth' })}

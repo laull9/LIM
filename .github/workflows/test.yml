@@ -33,3 +33,25 @@ jobs:
           xmake f -m ${{ matrix.mode }} --toolchain=clang --bin=/usr/lib/llvm-20/bin --runtimes=c++_shared -o build/xmake
           xmake
           xmake test --output-on-failure
+
+  web:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Install Web dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+      - name: Lint and build Web client
+        working-directory: web
+        run: |
+          pnpm lint
+          pnpm build

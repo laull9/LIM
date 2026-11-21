@@ -3,12 +3,23 @@ import { z } from 'zod'
 const uuid = z.string().regex(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/)
 const sequence = z.string().regex(/^(0|[1-9][0-9]{0,18})$/)
   .refine((value) => value.length < 19 || value <= '9223372036854775807')
-const sessionInfo = z.object({ generation: uuid, account: uuid, device: uuid })
+const token = z.string().regex(/^[0-9a-f]{64}$/)
+const account = z.object({ account: uuid, username: z.string(), display_name: z.string() })
+const sessionInfo = z.object({
+  generation: uuid,
+  account: uuid,
+  device: uuid,
+  username: z.string().optional(),
+  display_name: z.string().optional(),
+})
 const conversation = z.object({
   conversation_id: uuid,
   after: sequence,
   last_seq: sequence,
   profile: z.literal('host'),
+  kind: z.enum(['direct', 'group']).optional(),
+  title: z.string().optional(),
+  members: z.array(account).optional(),
 }).refine(({ after, last_seq }) => BigInt(after) <= BigInt(last_seq))
 const contentType = z.enum(['text/plain', 'application/json', 'application/octet-stream'])
 const event = z.object({
@@ -17,10 +28,31 @@ const event = z.object({
   client_message_id: uuid,
   content_type: contentType,
   payload_base64: z.base64().min(1),
+  account_id: uuid.optional(),
+  username: z.string().optional(),
+  display_name: z.string().optional(),
 })
 const eventPage = z.object({ events: z.array(event), up_to: sequence, next_after: sequence })
 const receipt = z.object({ seq: sequence, replayed: z.boolean() })
 const directoryPage = z.object({ conversations: z.array(conversation), next_after: uuid.nullable() })
+export const authResult = z.object({
+  generation: uuid,
+  account: uuid,
+  device: uuid,
+  username: z.string(),
+  display_name: z.string(),
+  access_token: token,
+  refresh_token: token,
+  access_expires_at: z.number().int().nonnegative(),
+  refresh_expires_at: z.number().int().nonnegative(),
+})
+const device = z.object({
+  device_id: uuid,
+  name: z.string(),
+  created_at: z.number().int().nonnegative(),
+  last_seen: z.number().int().nonnegative(),
+  revoked: z.boolean(),
+})
 const errorDetail = z.object({
   code: z.number().int(),
   message: z.string(),
@@ -41,10 +73,21 @@ const syncHint = z.object({
 export type Identity = z.infer<typeof sessionInfo>
 export type Conversation = z.infer<typeof conversation>
 export type WireEvent = z.infer<typeof event>
+export type Account = z.infer<typeof account>
+export type Device = z.infer<typeof device>
+export type AuthResult = z.infer<typeof authResult>
+export type AccountCredentials = {
+  username: string
+  password: string
+  device_id: string
+  device_name: string
+}
+export type RegisterCredentials = AccountCredentials & { display_name: string }
 
 const errors: Record<string, string> = {
-  unauthenticated: '设备令牌无效或已失效。',
+  unauthenticated: '登录状态或设备令牌无效，请重新登录。',
   device_revoked: '此设备已被撤销。',
+  username_taken: '这个用户名已被使用，请换一个。',
   not_found_or_forbidden: '此会话已不存在或设备已失去访问权限。',
   recovery_required: '服务已切换恢复代次。请重新连接设备。',
   cursor_expired: '部分历史消息已过期。',
@@ -97,9 +140,9 @@ export function delay(milliseconds: number, signal: AbortSignal) {
   })
 }
 
-async function request(path: string, token: string, options: RequestInit, signal: AbortSignal) {
+async function request(path: string, token: string | undefined, options: RequestInit, signal: AbortSignal) {
   const headers = new Headers(options.headers)
-  headers.set('Authorization', `Bearer ${token}`)
+  if (token) headers.set('Authorization', `Bearer ${token}`)
   let response: Response
   try {
     response = await fetch(path, {
@@ -137,33 +180,104 @@ function parse<T>(schema: z.ZodType<T>, value: unknown) {
   return result.data
 }
 
-export class LimClient {
-  readonly #token: string
+type Request = (path: string, options: RequestInit, signal: AbortSignal) => Promise<Response>
 
-  constructor(token: string) {
+async function rpc<T>(
+  method: string,
+  params: object,
+  schema: z.ZodType<T>,
+  signal: AbortSignal,
+  fetcher: Request,
+) {
+  const id = crypto.randomUUID()
+  const response = await fetcher('/rpc', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
+  }, signal)
+  const reply = parse(rpcResponse, await json(response))
+  if ('error' in reply) {
+    if (reply.id !== id && reply.id !== null) throw new LimError('invalid_response')
+    const { code, data } = reply.error
+    throw new LimError(data?.name ?? (code === -32001 ? 'unauthenticated' : 'rpc_error'),
+      data?.retryable, data?.sequence)
+  }
+  if (reply.id !== id) throw new LimError('invalid_response')
+  return parse(schema, reply.result)
+}
+
+function publicRpc<T>(method: string, params: object, schema: z.ZodType<T>, signal: AbortSignal) {
+  return rpc(method, params, schema, signal, (path, options, currentSignal) => (
+    request(path, undefined, options, currentSignal)
+  ))
+}
+
+export function register(credentials: RegisterCredentials, signal: AbortSignal) {
+  return publicRpc('account.register', credentials, authResult, signal)
+}
+
+export function login(credentials: AccountCredentials, signal: AbortSignal) {
+  return publicRpc('account.login', credentials, authResult, signal)
+}
+
+export function refresh(refresh_token: string, signal: AbortSignal) {
+  return publicRpc('account.refresh', { refresh_token }, authResult, signal)
+}
+
+export class LimClient {
+  #token: string
+  readonly #refresh: ((signal: AbortSignal) => Promise<string>) | undefined
+
+  constructor(token: string, refreshAccess?: (signal: AbortSignal) => Promise<string>) {
+    this.#token = token
+    this.#refresh = refreshAccess
+  }
+
+  setAccessToken(token: string) {
     this.#token = token
   }
 
-  private async rpc<T>(method: string, params: object, schema: z.ZodType<T>, signal: AbortSignal) {
-    const id = crypto.randomUUID()
-    const response = await request('/rpc', this.#token, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
-    }, signal)
-    const reply = parse(rpcResponse, await json(response))
-    if ('error' in reply) {
-      if (reply.id !== id && reply.id !== null) throw new LimError('invalid_response')
-      const { code, data } = reply.error
-      throw new LimError(data?.name ?? (code === -32001 ? 'unauthenticated' : 'rpc_error'),
-        data?.retryable, data?.sequence)
+  async #request(path: string, options: RequestInit, signal: AbortSignal) {
+    try {
+      return await request(path, this.#token, options, signal)
+    } catch (error) {
+      if (!this.#refresh || !(error instanceof LimError) || error.kind !== 'unauthenticated') throw error
+      const token = await this.#refresh(signal)
+      this.#token = token
+      return await request(path, token, options, signal)
     }
-    if (reply.id !== id) throw new LimError('invalid_response')
-    return parse(schema, reply.result)
+  }
+
+  private rpc<T>(method: string, params: object, schema: z.ZodType<T>, signal: AbortSignal) {
+    return rpc(method, params, schema, signal, (path, options, currentSignal) => (
+      this.#request(path, options, currentSignal)
+    ))
   }
 
   identify(signal: AbortSignal) {
     return this.rpc('session.info', {}, sessionInfo, signal)
+  }
+
+  logout(signal: AbortSignal) {
+    return this.rpc('account.logout', {}, z.object({ ok: z.literal(true) }), signal)
+  }
+
+  searchAccounts(generation: string, query: string, signal: AbortSignal) {
+    return this.rpc('account.search', { generation, query }, z.object({ users: z.array(account) }), signal)
+  }
+
+  startConversation(generation: string, account_ids: string[], title: string | undefined, signal: AbortSignal) {
+    return this.rpc('conversation.start', {
+      generation, account_ids, ...(title ? { title } : {}),
+    }, conversation, signal)
+  }
+
+  listDevices(generation: string, signal: AbortSignal) {
+    return this.rpc('device.list', { generation }, z.object({ devices: z.array(device) }), signal)
+  }
+
+  removeDevice(generation: string, device_id: string, signal: AbortSignal) {
+    return this.rpc('device.remove', { generation, device_id }, z.object({ ok: z.literal(true) }), signal)
   }
 
   async conversations(generation: string, signal: AbortSignal) {
@@ -196,7 +310,7 @@ export class LimClient {
   }
 
   async wait(generation: string, room: string, after: string, signal: AbortSignal) {
-    const response = await request(`/v1/conversations/${room}/wait?after_seq=${after}`, this.#token, {
+    const response = await this.#request(`/v1/conversations/${room}/wait?after_seq=${after}`, {
       headers: { 'LIM-Generation': generation },
     }, signal)
     if (response.headers.get('LIM-Generation') !== generation) throw new LimError('recovery_required')

@@ -55,3 +55,8 @@ if os.projectdir() == os.scriptdir() then
 end
 
 includes("tests/xmake.lua")
+
+-- 开发任务插件只在 LIM 作为顶层工程时注册，嵌入宿主时不引入 dev* 命令。
+if os.projectdir() == os.scriptdir() then
+    add_plugindirs("scripts/xmake/plugins")
+end

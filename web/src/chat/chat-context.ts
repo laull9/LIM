@@ -1,11 +1,13 @@
 import { createContext, useContext } from 'react'
-import type { Conversation, Identity } from './protocol'
+import type { Account, Conversation, Identity, LimClient } from './protocol'
 import type { PendingMessage, SavedMessage } from './storage'
 import type { SyncStatus } from './sync'
 
 export type Item = SavedMessage | PendingMessage
+export type Workspace = 'none' | 'new' | 'devices'
 
 export interface Chat {
+  client: LimClient
   identity: Identity
   rooms: Conversation[]
   roomsError: string
@@ -19,15 +21,20 @@ export interface Chat {
   status: SyncStatus
   issue: string
   verified: boolean
+  timelineReady: boolean
+  workspace: Workspace
   search: string
   infoOpen: boolean
   setSearch: (value: string) => void
   setInfoOpen: (value: boolean) => void
+  setWorkspace: (value: Workspace) => void
   refresh: () => void
   openRoom: (id: string) => void
   closeRoom: () => void
   loadOlderMessages: () => void
   send: (text: string) => Promise<void>
+  retryMessage: (id: string) => Promise<void>
+  logout: () => Promise<void>
   retry: () => void
 }
 
@@ -38,3 +45,5 @@ export function useChat() {
   if (!value) throw new Error('useChat 必须在 ChatProvider 内使用')
   return value
 }
+
+export type { Account, Conversation }

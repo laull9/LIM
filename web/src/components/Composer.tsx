@@ -5,20 +5,42 @@ import styles from './Composer.module.css'
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover'
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip'
 import { useChat } from '../chat/chat-context'
+import { roomKey } from '../chat/storage'
+import { roomTitle } from '../chat/naming'
 
 const MAX_BYTES = 65_536
 const EMOJI = ['🌊', '🫧', '🐚', '⛵️', '🌴', '☀️', '🌙', '🐟', '🦀', '💧', '🧭', '🌬️', '👋', '👍', '🎉', '✅']
 
+function readDraft(key: string) {
+  if (!key) return ''
+  try {
+    return localStorage.getItem(key) ?? ''
+  } catch {
+    return ''
+  }
+}
+
 export function Composer() {
-  const { active, verified, send } = useChat()
-  const [value, setValue] = useState('')
+  const { active, identity, timelineReady, status, send } = useChat()
+  const key = active ? `lim.draft.${roomKey(identity, active.conversation_id)}` : ''
+  const [value, setValue] = useState(() => readDraft(key))
   const [busy, setBusy] = useState(false)
   const [issue, setIssue] = useState('')
   const area = useRef<HTMLTextAreaElement>(null)
   const composing = useRef(false)
   const bytes = new TextEncoder().encode(value).length
   const oversized = bytes > MAX_BYTES
-  const canSend = verified && Boolean(active) && !busy && !oversized && Boolean(value.trim())
+  const canSend = timelineReady && Boolean(active) && !busy && !oversized && Boolean(value.trim())
+
+  useEffect(() => {
+    if (!key) return
+    try {
+      if (value) localStorage.setItem(key, value)
+      else localStorage.removeItem(key)
+    } catch {
+      // 浏览器禁用存储时草稿只保留在当前输入框。
+    }
+  }, [key, value])
 
   useEffect(() => {
     const element = area.current
@@ -76,8 +98,8 @@ export function Composer() {
           value={value}
           aria-label="消息正文"
           aria-invalid={oversized || Boolean(issue)}
-          placeholder={active ? `发消息到 ${active.conversation_id.slice(-6).toUpperCase()}…` : '选择一个会话开始对话'}
-          disabled={!verified || !active}
+          placeholder={active ? `发消息到 ${roomTitle(active, identity.account)}…` : '选择一个会话开始对话'}
+          disabled={!timelineReady || !active}
           onChange={(event) => { setValue(event.target.value); setIssue('') }}
           onKeyDown={onKeyDown}
           onCompositionStart={() => { composing.current = true }}
@@ -113,18 +135,18 @@ export function Composer() {
 
           {canSend || busy ? (
             <button className={styles.send} onClick={() => void submit()} disabled={!canSend} type="button">
-              <SendHorizontal size={15} /> {busy ? '发送中' : '发送'}
+              <SendHorizontal size={15} /> {busy ? '发送中' : status.state === 'offline' ? '排队' : '发送'}
             </button>
           ) : (
             <span className="ml-auto text-[11px] font-semibold text-muted-foreground">
-              {oversized ? '超过 64 KiB' : ''}
+              {oversized ? '超过 64 KiB' : status.state === 'offline' ? '离线可继续书写' : ''}
             </span>
           )}
         </div>
       </div>
       <div className={styles.hint}>
         <span data-error={oversized || Boolean(issue)}>
-          {issue || (oversized ? '消息超过 64 KiB，无法发送。' : (
+          {issue || (oversized ? '消息超过 64 KiB，无法发送。' : status.state === 'offline' ? '离线消息会排队，联网后自动发送。' : (
             <>
               <kbd>Enter</kbd> 发送 · <kbd>Shift</kbd> + <kbd>Enter</kbd> 换行
             </>

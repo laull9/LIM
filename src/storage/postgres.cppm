@@ -69,6 +69,13 @@ class PostgresRows final : public Rows {
         return {reinterpret_cast<const std::byte*>(contents), static_cast<std::size_t>(size)};
     }
 
+    std::string_view text(int column) const override {
+        const auto value = bytes(column);
+        return value.empty() ? std::string_view{}
+                             : std::string_view(reinterpret_cast<const char*>(value.data()),
+                                                value.size());
+    }
+
   private:
     QueryResult result_;
     int row_ = -1;
@@ -112,6 +119,10 @@ class PostgresDatabase final : public Database {
                 numbers[index] = std::to_string(*number);
                 values.push_back(numbers[index].c_str());
                 lengths.push_back(0);
+                formats.push_back(0);
+            } else if (const auto* text = std::get_if<std::string_view>(&parameter)) {
+                values.push_back(text->data());
+                lengths.push_back(static_cast<int>(text->size()));
                 formats.push_back(0);
             } else {
                 const auto bytes = std::get<Bytes>(parameter);

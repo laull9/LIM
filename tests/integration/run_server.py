@@ -216,6 +216,125 @@ def verify_recovery(test, directory, backend, backup, env=None, conninfo=None):
     print("backup restored with fresh generation, reviewed access and intact history", flush=True)
 
 
+def success(client, method, params, actor=None):
+    reply = client.rpc(call(method, params), actor)
+    assert "result" in reply, reply
+    return reply["result"]
+
+
+def verify_accounts(client, port):
+    """Exercise public account login, device registration and account-scoped rooms."""
+    device_a, device_b, device_a2, device_c = (uid(n) for n in (1001, 1002, 1003, 1004))
+    password = "correct-horse-battery"
+    common = {"password": password, "generation": GENERATION}
+
+    alice = success(client, "account.register", {
+        "username": "Alice", "display_name": "爱丽丝", "device_id": device_a,
+        "device_name": "Alice 的浏览器", "password": password,
+    })
+    assert alice["username"] == "alice" and alice["device"] == device_a, alice
+    client.tokens["alice_account"] = alice["access_token"]
+    error(client.rpc(call("account.register", {
+        "username": "alice", "display_name": "冒名者", "device_id": uid(1005),
+        "device_name": "Other", "password": password,
+    })), -32009, "username_taken")
+    error(client.rpc(call("account.login", {
+        **common, "username": "alice", "device_id": device_a,
+        "device_name": "Alice 的浏览器", "password": "wrong-password",
+    })), -32001)
+
+    bob = success(client, "account.register", {
+        "username": "bob", "display_name": "鲍勃", "device_id": device_b,
+        "device_name": "Bob 的浏览器", "password": password,
+    })
+    client.tokens["bob_account"] = bob["access_token"]
+    third = success(client, "account.register", {
+        "username": "charlie", "display_name": "查理", "device_id": device_c,
+        "device_name": "Charlie 的浏览器", "password": password,
+    })
+    client.tokens["charlie_account"] = third["access_token"]
+
+    found = success(client, "account.search", {"generation": GENERATION, "query": "bo"},
+                    "alice_account")
+    assert [item["username"] for item in found["users"]] == ["bob"], found
+
+    first = success(client, "conversation.start", {
+        "generation": GENERATION, "account_ids": [bob["account"]],
+    }, "alice_account")
+    again = success(client, "conversation.start", {
+        "generation": GENERATION, "account_ids": [alice["account"]],
+    }, "bob_account")
+    direct = first["conversation_id"]
+    assert again["conversation_id"] == direct and first["kind"] == "direct", (first, again)
+    assert {item["username"] for item in first["members"]} == {"alice", "bob"}, first
+
+    key = uid(1101)
+    sent = success(client, "message.send", {
+        "generation": GENERATION, "conversation_id": direct,
+        "client_message_id": key, "content_type": "text/plain", "text": "账号消息",
+    }, "alice_account")
+    assert sent == {"seq": "1", "replayed": False}, sent
+    page = success(client, "conversation.events", {
+        "generation": GENERATION, "conversation_id": direct, "after": "0",
+    }, "bob_account")
+    event = page["events"][0]
+    assert event["account_id"] == alice["account"] and event["username"] == "alice", event
+    assert base64.b64decode(event["payload_base64"]) == "账号消息".encode(), event
+    status, body = client.request(
+        "GET", f"/v1/conversations/{direct}/events?after_seq=0",
+        headers={"Authorization": f"Bearer {bob['access_token']}",
+                 "LIM-Generation": GENERATION})
+    assert status == 200 and alice["account"].encode() in body, (status, body)
+
+    login_a2 = success(client, "account.login", {
+        **common, "username": "alice", "device_id": device_a2,
+        "device_name": "Alice 的第二台设备",
+    })
+    assert login_a2["device"] == device_a2 and login_a2["account"] == alice["account"]
+    client.tokens["alice_second"] = login_a2["access_token"]
+    listing = success(client, "conversation.list", {"generation": GENERATION}, "alice_second")
+    assert [item["conversation_id"] for item in listing["conversations"]] == [direct], listing
+    history = success(client, "conversation.events", {
+        "generation": GENERATION, "conversation_id": direct, "after": "0",
+    }, "alice_second")
+    assert history["events"][0]["account_id"] == alice["account"], history
+
+    rotated = success(client, "account.refresh", {
+        "refresh_token": login_a2["refresh_token"],
+    })
+    client.tokens["alice_second_refresh"] = rotated["access_token"]
+    assert rotated["refresh_token"] != login_a2["refresh_token"], rotated
+    error(client.rpc(call("account.refresh", {
+        "refresh_token": login_a2["refresh_token"],
+    })), -32001)
+    assert success(client, "session.info", {}, "alice_second_refresh")["account"] == alice["account"]
+    success(client, "account.logout", {}, "alice_second_refresh")
+    error(client.rpc(call("session.info", {}), "alice_second_refresh"), -32001)
+
+    devices = success(client, "device.list", {"generation": GENERATION}, "alice_account")
+    assert {item["device_id"] for item in devices["devices"]} >= {device_a, device_a2}, devices
+    success(client, "device.remove", {
+        "generation": GENERATION, "device_id": device_a2,
+    }, "alice_account")
+    error(client.rpc(call("account.refresh", {
+        "refresh_token": rotated["refresh_token"],
+    })), -32001)
+
+    group = success(client, "conversation.start", {
+        "generation": GENERATION, "account_ids": [bob["account"], third["account"]],
+        "title": "潮汐群",
+    }, "alice_account")
+    assert group["kind"] == "group" and group["title"] == "潮汐群", group
+    charlie_rooms = success(client, "conversation.list", {
+        "generation": GENERATION,
+    }, "charlie_account")
+    assert group["conversation_id"] in {
+        item["conversation_id"] for item in charlie_rooms["conversations"]
+    }, charlie_rooms
+    print("accounts, automatic devices, refresh, directory inheritance and group chat verified",
+          flush=True)
+
+
 def binary_header(room, key, content_type="application/octet-stream"):
     return {"v": 1, "type": "message.send", "request_id": "wire-1",
             "recovery_generation": GENERATION, "conversation_id": room,
@@ -399,6 +518,7 @@ def run_server(test, directory, backend, env=None, conninfo=None):
             error(client.rpc(message, "alice"), -32009, "idempotency_expired")
             error(client.rpc(history, "alice"), -32010, "cursor_expired")
             verify_wire(client, port)
+            verify_accounts(client, port)
             assert client.rpc(call("device.revoke", {"generation": GENERATION, "device_id": BOB}),
                               "operator")["result"]["ok"]
         finally:

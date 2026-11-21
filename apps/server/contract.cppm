@@ -37,6 +37,8 @@ FailureInfo failure_info(Error code) {
         return {-32004, 404, "not_found_or_forbidden"};
     case InvalidArgument:
         return {-32602, 400, "invalid_argument"};
+    case UsernameTaken:
+        return {-32009, 409, "username_taken"};
     case PayloadTooLarge:
         return {-32013, 413, "payload_too_large"};
     case ProfileMismatch:

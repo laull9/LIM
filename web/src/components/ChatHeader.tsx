@@ -2,13 +2,13 @@ import { ArrowLeft, Eye, Info, RefreshCw, RotateCcw } from 'lucide-react'
 import { Button } from './ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip'
 import { useChat } from '../chat/chat-context'
-import { roomColor, roomName } from '../chat/naming'
+import { roomColor, roomTitle } from '../chat/naming'
 
-const LABEL = { online: '已连接', offline: '重连中', loading: '同步中', blocked: '同步暂停' } as const
+const LABEL = { online: '已连接', offline: '离线缓存', loading: '同步中', blocked: '同步暂停' } as const
 
-/** 会话头部：标题、同步状态与信息面板开关。 */
+/** 会话头部：真实标题、同步状态与信息面板开关。 */
 export function ChatHeader() {
-  const { active, status, closeRoom, refresh, infoOpen, setInfoOpen, retry } = useChat()
+  const { active, identity, status, closeRoom, refresh, infoOpen, setInfoOpen, retry } = useChat()
   if (!active) return null
   const id = active.conversation_id
 
@@ -29,7 +29,7 @@ export function ChatHeader() {
 
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <h2 className="truncate text-[15px] font-extrabold tracking-tight">{roomName(id)}</h2>
+            <h2 className="truncate text-[15px] font-extrabold tracking-tight">{roomTitle(active, identity.account)}</h2>
             <span className="hidden truncate font-mono text-[10px] text-muted-foreground sm:inline" title={id}>
               {id}
             </span>

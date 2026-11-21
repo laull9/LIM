@@ -5,6 +5,7 @@ module;
 #include <expected>
 #include <optional>
 #include <span>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -68,6 +69,9 @@ struct Event {
     EventKind kind;
     MessageFormat format;
     std::vector<std::byte> payload;
+    Id sender_account;
+    std::string username;
+    std::string display_name;
 };
 
 struct Page {
@@ -80,6 +84,7 @@ enum class Error {
     DeviceRevoked,
     NotFoundOrForbidden,
     InvalidArgument,
+    UsernameTaken,
     PayloadTooLarge,
     ProfileMismatch,
     IdempotencyConflict,

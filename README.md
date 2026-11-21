@@ -1,6 +1,6 @@
 # LIM
 
-LIM 是面向单聊、小群和 Agent Harness 的轻量聊天服务器项目。当前可作为 C++23 库嵌入宿主进程，支持用 SQLite 文件或 PostgreSQL 数据库持久化宿主可读会话。两种后端使用同一个有序事件日志契约，支持发送、分页补齐、幂等重试、设备授权与撤销、重新加入和保留期清理。`lim-server` 提供本地 HTTP JSON-RPC 2.0 和二进制 HTTP，支持设备认证、会话管理、发送、补齐和长轮询。WebSocket 与 MLS 端到端加密在后续路线中。
+LIM 是面向单聊、小群和 Agent Harness 的轻量聊天服务器项目。当前账号版已贯通注册、登录、刷新恢复、自动设备登记、用户查找、私聊/小群创建、宿主可读文字收发、离线缓存和跨会话待发投递。消息仍为 `host`/宿主可读模式，MLS 端到端加密尚未实现。存储使用 SQLite 文件或 PostgreSQL，两种后端共享有序事件日志、幂等重试、补齐、恢复代次和保留期契约；`lim-server` 提供 JSON-RPC 2.0、二进制 HTTP 和长轮询。WebSocket 仍为后续路线。
 
 | xmake 目标 | 模块 | 职责 |
 | --- | --- | --- |
@@ -11,7 +11,7 @@ LIM 是面向单聊、小群和 Agent Harness 的轻量聊天服务器项目。�
 
 ## 构建与测试
 
-需要 xmake 3.1.2+、支持 C++23 命名模块和 `std::expected` 的工具链，以及 pkg-config 能找到的 SQLite 3.37+ 和 libpq 14+ 开发包。Clang 工具链需要同版本的 `clang-scan-deps`。使用包管理器安装系统库，配在非标准目录时用 `PKG_CONFIG_PATH` 指向对应的 `.pc` 目录。
+需要 xmake 3.1.2+、支持 C++23 命名模块和 `std::expected` 的工具链，以及 pkg-config 能找到的 SQLite 3.37+、libpq 14+ 和 OpenSSL 3.0+ `libcrypto` 开发包。Clang 工具链需要同版本的 `clang-scan-deps`。使用包管理器安装系统库，配在非标准目录时用 `PKG_CONFIG_PATH` 指向对应的 `.pc` 目录。
 
 ```sh
 git submodule update --init inc/ltool
@@ -32,6 +32,42 @@ xmake f -m release --toolchain=clang -o build/xmake
 xmake test --output-on-failure
 ```
 
+## 开发任务（xmake 插件）
+
+`scripts/xmake/plugins/` 提供一组项目级 xmake 插件，把常用手工命令收敛成 `xmake dev*`。`xmake --help` 的 Plugins 段会列出它们，`xmake <任务> --help` 查看选项。
+
+| 命令 | 作用 |
+| --- | --- |
+| `xmake dev` | 一键完整开发环境：构建 `lim-server`、临时 SQLite、注册 `alice` / `bob` 演示账号、启动 Vite。 |
+| `xmake dev-server` | 只启动后端，使用 `build/dev/` 下的持久开发数据库，默认监听 7400。 |
+| `xmake dev-web` | 只启动 Vite，默认把 `/rpc`、`/v1/` 代理到 `127.0.0.1:7400`。 |
+| `xmake dev-check` | 一键校验：`xmake test` 全套 + `pnpm lint` + `pnpm build`。 |
+| `xmake dev-config` | 生成或查看开发配置、本地操作员令牌（`--show`），不启动服务。 |
+| `xmake dev-clean` | 清理 `build/dev/` 下的数据库、配置与令牌（`--dry-run` 仅预览）。 |
+
+两个终端各跑一条命令即可开始持久开发，数据重启后保留：
+
+```sh
+xmake dev-server   # 终端 1：后端，首次运行会自动构建
+xmake dev-web      # 终端 2：前端 http://127.0.0.1:5173/
+```
+
+只想快速看演示时，一条命令即可（每次都是全新的临时数据库）：
+
+```sh
+xmake dev
+```
+
+打开 [本地客户端](http://127.0.0.1:5173/)，用终端打印的 `alice` / `bob` 与统一密码 `lim-demo-pass` 分别在两个独立浏览器上下文登录。
+
+几个约定：
+
+- `dev-server` 把 `lim.json`、`lim-dev.db`、`operator.token` 放在 `build/dev/`（已忽略）；可用 `LIM_DEV_DIR` 改位置，`dev-clean` 只删这几个固定文件。
+- **generation 与操作员令牌会持久化复用**：存储会核对恢复代次，每次启动换随机数会导致下次启动失败。只有 `--reset` 才重建数据库并更换两者；`dev-config --show` 可再次查看令牌。
+- 配置的 `devices` 为空，普通用户走账号注册／登录；操作员令牌只用于本地调试旧版操作员 RPC，不要用于生产。
+- `dev-server --backend=postgresql` 需要 `LIM_SERVER_PG` 连接串；`dev-web --backend-url` 可指向其他后端，`--preview --build` 用生产构建预览；`dev-check --cpp-only` / `--web-only` 可只跑一侧。
+- 常驻任务都在前台运行，`Ctrl+C` 停止；子进程异常退出（端口占用、配置错误等）会让 xmake 以非零码失败。
+
 ## 编辑器索引
 
 Clice 读取 `build/ide/compile_commands.json`。xmake 构建时自动刷新编译数据库，模块、编译器及依赖参数取自当前构建配置。只更新索引参数时运行下面的命令。
@@ -46,7 +82,9 @@ xmake project -k compile_commands --lsp=clangd build/ide
 
 `lim-server` 使用 LTool 的 LWeb 和 LJson，通过 `--config FILE` 启动。依赖、设备和操作员凭据配置、方法表及请求示例见 [JSON-RPC 2.0](docs/rpc.md)。原始正文收发和低开销在线提示见 [二进制 HTTP](docs/protocol.md)。
 
-[LIM Web demo](web/README.md#启动双端-demo) 可连接现有服务，也可用临时 SQLite 数据库启动两个演示设备，在浏览器中双向收发。
+[LIM Web demo](web/README.md#启动双端-demo) 用临时 SQLite 数据库注册两个演示账号、登录并自动登记设备，在两个隔离浏览器上下文中完成收发。也可以连接现有服务；受控设备令牌入口仍然保留。
+
+当前账号密码由 OpenSSL scrypt 保存，访问/刷新令牌只保存 SHA-256 摘要并支持轮换、注销和设备撤销。服务端仍可读取 `host` 会话正文，不能把它当作端到端加密使用；[MLS 设计](docs/security.md)尚未落地。
 
 ## 首版 demo
 

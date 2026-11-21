@@ -4,9 +4,9 @@ import { Button } from './ui/button'
 import { Separator } from './ui/separator'
 import { WaveStack } from './WaveDecor'
 import { useChat } from '../chat/chat-context'
-import { roomColor, roomName } from '../chat/naming'
+import { accountLabel, roomColor, roomTitle } from '../chat/naming'
 
-const LABEL = { online: '已连接', offline: '重连中', loading: '同步中', blocked: '同步暂停' } as const
+const LABEL = { online: '已连接', offline: '离线缓存', loading: '同步中', blocked: '同步暂停' } as const
 
 function Row({ label, value, mono = true, title }: { label: string; value: string; mono?: boolean; title?: string }) {
   return (
@@ -23,10 +23,10 @@ function Row({ label, value, mono = true, title }: { label: string; value: strin
 }
 
 /** 会话信息面板：展示服务端返回的真实元数据与本地同步游标。 */
-export function InfoPanel({ onDisconnect }: { onDisconnect: () => void }) {
+export function InfoPanel() {
   const {
     active, identity, status, position, items, canLoadOlder, olderBusy,
-    loadOlderMessages, retry, refresh, setInfoOpen,
+    loadOlderMessages, retry, refresh, setInfoOpen, logout,
   } = useChat()
   if (!active) return null
   const id = active.conversation_id
@@ -52,7 +52,7 @@ export function InfoPanel({ onDisconnect }: { onDisconnect: () => void }) {
             >
               〰
             </span>
-            <div className="mt-3 text-base font-extrabold">{roomName(id)}</div>
+            <div className="mt-3 text-base font-extrabold">{roomTitle(active, identity.account)}</div>
             <div className="mt-1 break-all px-2 font-mono text-[10px] text-muted-foreground">{id}</div>
             <Badge variant="muted" className="mt-2 gap-1">宿主可读 · host</Badge>
           </div>
@@ -65,7 +65,7 @@ export function InfoPanel({ onDisconnect }: { onDisconnect: () => void }) {
           <Row label="最新序号" value={`#${active.last_seq}`} />
           <Row label="可见起点" value={`#${active.after}`} />
           <Row label="恢复代次" value={identity.generation} title={identity.generation} />
-          <Row label="账号" value={identity.account} />
+          <Row label="当前账号" value={accountLabel(identity)} mono={false} />
           <Row label="当前设备" value={identity.device} />
         </div>
 
@@ -99,8 +99,8 @@ export function InfoPanel({ onDisconnect }: { onDisconnect: () => void }) {
 
         <div className="p-3">
           <Button variant="ghost" className="w-full justify-start text-coral hover:bg-coral/10 hover:text-coral"
-            onClick={onDisconnect}>
-            <LogOut /> 断开此设备
+            onClick={() => void logout()}>
+            <LogOut /> 退出登录
           </Button>
         </div>
       </div>

@@ -49,8 +49,9 @@ WireReply error(Error code, std::string_view request_id = {}) {
     return wire_error(Failure{code, std::nullopt}, request_id);
 }
 
-Result<Session> session_for(const Config& config, std::string_view token, Id generation) {
-    const auto principal = authenticate(config, token);
+Result<Session> session_for(Store& store, const Config& config, std::string_view token,
+                            Id generation) {
+    const auto principal = authenticate(store, config, token);
     if (!principal.session) {
         return std::unexpected(Failure{Error::Unauthenticated, std::nullopt});
     }
@@ -91,6 +92,7 @@ Json event_header(const Event& event, Id conversation, Id generation) {
     header["conversation_id"] = encode_id(conversation);
     header["conversation_seq"] = std::to_string(event.seq);
     header["device_id"] = encode_id(event.sender_device);
+    header["account_id"] = encode_id(event.sender_account);
     header["client_message_id"] = encode_id(event.client_message_id);
     header["profile"] = "host";
     header["content_type"] = std::string(content_type(event.format));
@@ -137,7 +139,7 @@ WireReply append_record(Store& store, const Config& config, std::string_view tok
         !key || *key == Id{}) {
         return error(Error::InvalidArgument, request_id);
     }
-    const auto session = session_for(config, token, *generation);
+    const auto session = session_for(store, config, token, *generation);
     if (!session) {
         return wire_error(session.error(), request_id);
     }
@@ -177,7 +179,7 @@ WireReply append_record(Store& store, const Config& config, std::string_view tok
 
 WireReply read_records(Store& store, const Config& config, std::string_view token, Id generation,
                        const Read& query) {
-    const auto session = session_for(config, token, generation);
+    const auto session = session_for(store, config, token, generation);
     if (!session) {
         return wire_error(session.error());
     }
@@ -190,7 +192,6 @@ WireReply read_records(Store& store, const Config& config, std::string_view toke
         payload_bytes += event.payload.size();
     }
     std::string body;
-    // Reserve the payload plus typical headers. The storage page keeps the hard limit.
     body.reserve(payload_bytes + page->events.size() * 400);
     for (const auto& event : page->events) {
         if (event.kind != EventKind::Message || content_type(event.format).empty()) {
@@ -208,7 +209,7 @@ WireReply read_records(Store& store, const Config& config, std::string_view toke
 std::optional<WireReply> wait_for_events(Store& store, const Config& config, std::string_view token,
                                          Id generation, Id conversation, Sequence after,
                                          bool final_check) {
-    const auto session = session_for(config, token, generation);
+    const auto session = session_for(store, config, token, generation);
     if (!session) {
         return wire_error(session.error());
     }

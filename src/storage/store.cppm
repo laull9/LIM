@@ -1,5 +1,6 @@
 module;
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <expected>
 #include <limits>
@@ -11,6 +12,7 @@ module;
 #include <string_view>
 #include <utility>
 #include <variant>
+#include <vector>
 
 module lim.storage;
 import :database;
@@ -21,7 +23,7 @@ namespace {
 
 using namespace storage_detail;
 
-constexpr Sequence kSchemaVersion = 1;
+constexpr Sequence kSchemaVersion = 2;
 constexpr Sequence kText = 0;
 constexpr Sequence kJson = 1;
 constexpr Sequence kBinary = 2;
@@ -30,6 +32,22 @@ static_assert(kMessageBytes == 65536);
 
 std::unexpected<Failure> fail(Error code, std::optional<Sequence> sequence = std::nullopt) {
     return std::unexpected(Failure{code, sequence});
+}
+
+Bytes blob(const Id& id) {
+    return std::as_bytes(std::span(id.bytes));
+}
+
+Bytes blob(const SecretDigest& digest) {
+    return std::as_bytes(std::span(digest));
+}
+
+std::string_view view(const std::string& text) {
+    return std::string_view(text);
+}
+
+std::string text(Rows& rows, int column) {
+    return std::string(rows.text(column));
 }
 
 Id decode_id(Bytes bytes) {
@@ -107,24 +125,26 @@ class Transaction {
 std::expected<void, StorageOpenError> initialize(Database& db, Id generation) {
     Transaction transaction(db, TransactionMode::Migration);
     if (db.is_postgres()) {
-        // Database-local lock also covers the first open when there is no metadata row yet.
         db.exec("SELECT pg_advisory_xact_lock(1279872257)");
     }
     apply_schema(db, kMetadataSchema);
     auto rows = db.query("SELECT version, generation FROM lim_metadata WHERE singleton = 1", {});
     if (rows->next()) {
-        if (rows->integer(0) != kSchemaVersion) {
-            return std::unexpected(StorageOpenError::UnsupportedSchema);
-        }
+        const auto version = rows->integer(0);
         if (decode_id(rows->bytes(1)) != generation) {
             return std::unexpected(StorageOpenError::GenerationMismatch);
         }
-        rows.reset();
+        if (version == 1) {
+            rows.reset();
+            apply_schema(db, kMigrationV2);
+        } else if (version != kSchemaVersion) {
+            return std::unexpected(StorageOpenError::UnsupportedSchema);
+        }
     } else {
         rows.reset();
-        apply_schema(db, kSchemaV1);
+        apply_schema(db, kSchemaV2);
         db.exec("INSERT INTO lim_metadata(singleton, version, generation) VALUES (1, $1, $2)",
-                {kSchemaVersion, Bytes(generation.bytes)});
+                {kSchemaVersion, blob(generation)});
     }
     transaction.commit();
     return {};
@@ -153,6 +173,30 @@ class SqlStore final : public Store {
     Result<void> expire_through(Id conversation, Sequence through) override;
     Result<Receipt> append(const Session& session, const Append& cmd) override;
     Result<Page> read(const Session& session, const Read& query) override;
+    Result<StoredAccount> create_account(Id id, std::string_view username,
+                                         std::string_view display_name,
+                                         std::string_view password_hash) override;
+    Result<StoredAccount> account_by_username(std::string_view username) override;
+    Result<AuthContext> create_login(Id login, Id account, Id device,
+                                     std::string_view device_name, Id credential,
+                                     SecretDigest access_digest, SecretDigest refresh_digest,
+                                     Sequence now, Sequence access_expires,
+                                     Sequence refresh_expires) override;
+    Result<AuthContext> rotate_login(SecretDigest old_refresh, SecretDigest access_digest,
+                                     SecretDigest refresh_digest, Sequence now,
+                                     Sequence access_expires,
+                                     Sequence refresh_expires) override;
+    Result<AuthContext> access_session(SecretDigest access_digest, Sequence now) override;
+    Result<void> logout(Id login, Id account) override;
+    Result<std::vector<AccountProfile>> search_accounts(const Session& session,
+                                                         std::string_view prefix,
+                                                         Sequence limit) override;
+    Result<ConversationSummary> start_conversation(const Session& session, Id conversation,
+                                                   std::span<const Id> targets,
+                                                   std::string_view kind, std::string_view title,
+                                                   std::string_view direct_key) override;
+    Result<std::vector<DeviceSummary>> list_devices(const Session& session) override;
+    Result<void> remove_device(const Session& session, Id device) override;
 
   private:
     template <typename Operation> auto transact(TransactionMode mode, Operation&& operation) {
@@ -160,8 +204,6 @@ class SqlStore final : public Store {
         try {
             Transaction transaction(*db_, mode);
             if (db_->is_postgres() && mode == TransactionMode::Write) {
-                // Keep membership changes, credential revocation and appends in one order,
-                // even when the host opens multiple handles.
                 db_->exec("SELECT singleton FROM lim_metadata WHERE singleton = 1 FOR UPDATE");
             }
             auto result = operation();
@@ -177,6 +219,7 @@ class SqlStore final : public Store {
     Result<void> verify_generation(Id generation);
     Result<void> authenticate(const Session& session);
     Result<Room> authorized_room(const Session& session, Id conversation);
+    Result<std::vector<AccountProfile>> conversation_members(Id conversation);
 
     std::unique_ptr<Database> db_;
 };
@@ -212,27 +255,66 @@ Result<void> SqlStore::authenticate(const Session& session) {
         FROM lim_device d LEFT JOIN lim_metadata g ON g.singleton = 1
         WHERE d.id = $1
     )SQL",
-                           {Bytes(session.device.bytes)});
+                           {blob(session.device)});
     return authenticate_row(*rows, session);
 }
 
 Result<Room> SqlStore::authorized_room(const Session& session, Id conversation) {
     auto rows = db_->query(R"SQL(
-        SELECT d.account, d.credential, d.revoked, g.generation,
-               m.conversation, c.last_seq, c.retained_after, m.joined_after
+        SELECT d.account, d.credential, d.revoked, g.generation
         FROM lim_device d LEFT JOIN lim_metadata g ON g.singleton = 1
-        LEFT JOIN lim_member m ON m.device = d.id AND m.conversation = $2
-        LEFT JOIN lim_conversation c ON c.id = m.conversation
         WHERE d.id = $1
     )SQL",
-                           {Bytes(session.device.bytes), Bytes(conversation.bytes)});
+                           {blob(session.device)});
     if (const auto auth = authenticate_row(*rows, session); !auth) {
         return std::unexpected(auth.error());
     }
-    if (rows->bytes(4).empty()) {
+    rows.reset();
+    auto account_member = db_->query(R"SQL(
+        SELECT joined_after FROM lim_account_member
+        WHERE conversation = $1 AND account = $2
+    )SQL",
+                                     {blob(conversation), blob(session.account)});
+    Sequence joined_after = 0;
+    bool allowed = false;
+    if (account_member->next()) {
+        joined_after = account_member->integer(0);
+        allowed = true;
+    }
+    account_member.reset();
+    auto device_member = db_->query(R"SQL(
+        SELECT joined_after FROM lim_member WHERE conversation = $1 AND device = $2
+    )SQL",
+                                    {blob(conversation), blob(session.device)});
+    if (device_member->next()) {
+        joined_after = std::max(joined_after, device_member->integer(0));
+        allowed = true;
+    }
+    device_member.reset();
+    if (!allowed) {
         return fail(Error::NotFoundOrForbidden);
     }
-    return Room{rows->integer(5), rows->integer(6), rows->integer(7)};
+    auto room = db_->query("SELECT last_seq, retained_after FROM lim_conversation WHERE id = $1",
+                           {blob(conversation)});
+    if (!room->next()) {
+        return fail(Error::NotFoundOrForbidden);
+    }
+    return Room{room->integer(0), room->integer(1), joined_after};
+}
+
+Result<std::vector<AccountProfile>> SqlStore::conversation_members(Id conversation) {
+    auto rows = db_->query(R"SQL(
+        SELECT a.id, a.username, a.display_name
+        FROM lim_account_member m JOIN lim_account a ON a.id = m.account
+        WHERE m.conversation = $1 AND a.username IS NOT NULL
+        ORDER BY a.username
+    )SQL",
+                           {blob(conversation)});
+    std::vector<AccountProfile> members;
+    while (rows->next()) {
+        members.push_back({decode_id(rows->bytes(0)), text(*rows, 1), text(*rows, 2)});
+    }
+    return members;
 }
 
 Result<ConversationSummary> SqlStore::conversation_summary(const Session& session,
@@ -242,8 +324,11 @@ Result<ConversationSummary> SqlStore::conversation_summary(const Session& sessio
         if (!room) {
             return std::unexpected(room.error());
         }
-        return ConversationSummary{conversation, std::max(room->retained_after, room->joined_after),
-                                   room->last_seq};
+        ConversationSummary summary{};
+        summary.id = conversation;
+        summary.after = std::max(room->retained_after, room->joined_after);
+        summary.last_seq = room->last_seq;
+        return summary;
     });
 }
 
@@ -262,24 +347,51 @@ Result<ConversationPage> SqlStore::list_conversations(const Session& session,
             return std::unexpected(auth.error());
         }
         const auto cursor = after.value_or(Id{});
-        auto rows =
-            db_->query(R"SQL(
-            SELECT c.id, c.retained_after, m.joined_after, c.last_seq
-            FROM lim_member m JOIN lim_conversation c ON c.id = m.conversation
-            WHERE m.device = $1 AND ($2 = 0 OR m.conversation > $3)
-            ORDER BY m.conversation LIMIT $4
+        auto rows = db_->query(R"SQL(
+            WITH scoped AS (
+                SELECT conversation, joined_after, CAST(1 AS BIGINT) AS scoped
+                FROM lim_account_member WHERE account = $1
+                UNION ALL
+                SELECT m.conversation, m.joined_after, CAST(0 AS BIGINT)
+                FROM lim_member m JOIN lim_device d ON d.id = m.device
+                WHERE d.id = $2 AND d.account = $1
+            )
+            SELECT c.id, c.retained_after, MAX(scoped.joined_after), c.last_seq,
+                   MAX(scoped.scoped), c.kind, c.title
+            FROM scoped JOIN lim_conversation c ON c.id = scoped.conversation
+            WHERE ($3 = 0 OR c.id > $4)
+            GROUP BY c.id, c.retained_after, c.last_seq, c.kind, c.title
+            ORDER BY c.id LIMIT $5
         )SQL",
-                       {Bytes(session.device.bytes), static_cast<Sequence>(after.has_value()),
-                        Bytes(cursor.bytes), static_cast<Sequence>(kPageEvents + 1)});
+                               {blob(session.account), blob(session.device),
+                                static_cast<Sequence>(after.has_value()), blob(cursor),
+                                static_cast<Sequence>(kPageEvents + 1)});
         ConversationPage page;
+        std::vector<ConversationSummary> summaries;
         while (rows->next()) {
-            if (page.conversations.size() == kPageEvents) {
-                page.next_after = page.conversations.back().id;
+            if (summaries.size() == kPageEvents) {
+                page.next_after = summaries.back().id;
                 break;
             }
-            page.conversations.push_back({decode_id(rows->bytes(0)),
-                                          std::max(rows->integer(1), rows->integer(2)),
-                                          rows->integer(3)});
+            ConversationSummary summary{};
+            summary.id = decode_id(rows->bytes(0));
+            summary.after = std::max(rows->integer(1), rows->integer(2));
+            summary.last_seq = rows->integer(3);
+            summary.kind = text(*rows, 5);
+            summary.title = text(*rows, 6);
+            summary.account_scoped = rows->integer(4) != 0;
+            summaries.push_back(std::move(summary));
+        }
+        rows.reset();
+        for (auto& summary : summaries) {
+            if (summary.account_scoped) {
+                const auto members = conversation_members(summary.id);
+                if (!members) {
+                    return std::unexpected(members.error());
+                }
+                summary.members = *members;
+            }
+            page.conversations.push_back(std::move(summary));
         }
         return page;
     });
@@ -291,11 +403,15 @@ Result<void> SqlStore::register_device(const Session& session) {
             return generation;
         }
         db_->exec(R"SQL(
-            INSERT INTO lim_device(id, account, credential) VALUES ($1, $2, $3)
+            INSERT INTO lim_account(id, display_name) VALUES ($1, '预配置账号')
             ON CONFLICT DO NOTHING
         )SQL",
-                  {Bytes(session.device.bytes), Bytes(session.account.bytes),
-                   Bytes(session.credential.bytes)});
+                  {blob(session.account)});
+        db_->exec(R"SQL(
+            INSERT INTO lim_device(id, account, credential, name) VALUES ($1, $2, $3, '预配置设备')
+            ON CONFLICT DO NOTHING
+        )SQL",
+                  {blob(session.device), blob(session.account), blob(session.credential)});
         return authenticate(session);
     });
 }
@@ -303,12 +419,13 @@ Result<void> SqlStore::register_device(const Session& session) {
 Result<void> SqlStore::revoke_device(Id device) {
     return transact(TransactionMode::Write, [&]() -> Result<void> {
         auto rows = db_->query("UPDATE lim_device SET revoked = 1 WHERE id = $1 RETURNING revoked",
-                               {Bytes(device.bytes)});
+                               {blob(device)});
         if (!rows->next()) {
             return fail(Error::NotFoundOrForbidden);
         }
         rows.reset();
-        db_->exec("DELETE FROM lim_member WHERE device = $1", {Bytes(device.bytes)});
+        db_->exec("DELETE FROM lim_member WHERE device = $1", {blob(device)});
+        db_->exec("UPDATE lim_auth_session SET revoked = 1 WHERE device = $1", {blob(device)});
         return {};
     });
 }
@@ -316,7 +433,7 @@ Result<void> SqlStore::revoke_device(Id device) {
 Result<void> SqlStore::create_host_conversation(Id conversation) {
     return transact(TransactionMode::Write, [&]() -> Result<void> {
         db_->exec("INSERT INTO lim_conversation(id) VALUES ($1) ON CONFLICT DO NOTHING",
-                  {Bytes(conversation.bytes)});
+                  {blob(conversation)});
         return {};
     });
 }
@@ -327,7 +444,7 @@ Result<void> SqlStore::set_member(Id conversation, Id device, bool active) {
             SELECT c.last_seq, d.revoked FROM lim_conversation c CROSS JOIN lim_device d
             WHERE c.id = $1 AND d.id = $2
         )SQL",
-                               {Bytes(conversation.bytes), Bytes(device.bytes)});
+                               {blob(conversation), blob(device)});
         if (!rows->next()) {
             return fail(Error::NotFoundOrForbidden);
         }
@@ -341,10 +458,10 @@ Result<void> SqlStore::set_member(Id conversation, Id device, bool active) {
                 INSERT INTO lim_member(conversation, device, joined_after) VALUES ($1, $2, $3)
                 ON CONFLICT DO NOTHING
             )SQL",
-                      {Bytes(conversation.bytes), Bytes(device.bytes), floor});
+                      {blob(conversation), blob(device), floor});
         } else {
             db_->exec("DELETE FROM lim_member WHERE conversation = $1 AND device = $2",
-                      {Bytes(conversation.bytes), Bytes(device.bytes)});
+                      {blob(conversation), blob(device)});
         }
         return {};
     });
@@ -354,7 +471,7 @@ Result<void> SqlStore::expire_through(Id conversation, Sequence through) {
     return transact(TransactionMode::Write, [&]() -> Result<void> {
         auto rows =
             db_->query("SELECT last_seq, retained_after FROM lim_conversation WHERE id = $1",
-                       {Bytes(conversation.bytes)});
+                       {blob(conversation)});
         if (!rows->next()) {
             return fail(Error::NotFoundOrForbidden);
         }
@@ -366,9 +483,9 @@ Result<void> SqlStore::expire_through(Id conversation, Sequence through) {
         if (through > floor) {
             db_->exec("UPDATE lim_event SET payload = NULL WHERE conversation = $1 "
                       "AND seq > $2 AND seq <= $3",
-                      {Bytes(conversation.bytes), floor, through});
+                      {blob(conversation), floor, through});
             db_->exec("UPDATE lim_conversation SET retained_after = $2 WHERE id = $1",
-                      {Bytes(conversation.bytes), through});
+                      {blob(conversation), through});
         }
         return {};
     });
@@ -392,8 +509,8 @@ Result<Receipt> SqlStore::append(const Session& session, const Append& cmd) {
             SELECT seq, format, payload FROM lim_event
             WHERE conversation = $1 AND device = $2 AND client_key = $3
         )SQL",
-                                   {Bytes(cmd.conversation.bytes), Bytes(session.device.bytes),
-                                    Bytes(cmd.client_message_id.bytes)});
+                                   {blob(cmd.conversation), blob(session.device),
+                                    blob(cmd.client_message_id)});
         if (previous->next()) {
             const auto seq = previous->integer(0);
             if (seq <= room->joined_after) {
@@ -424,10 +541,10 @@ Result<Receipt> SqlStore::append(const Session& session, const Append& cmd) {
             INSERT INTO lim_event(conversation, seq, device, client_key, format, payload)
             VALUES ($1, $2, $3, $4, $5, $6)
         )SQL",
-                  {Bytes(cmd.conversation.bytes), seq, Bytes(session.device.bytes),
-                   Bytes(cmd.client_message_id.bytes), *encoded, cmd.payload});
+                  {blob(cmd.conversation), seq, blob(session.device),
+                   blob(cmd.client_message_id), *encoded, cmd.payload});
         db_->exec("UPDATE lim_conversation SET last_seq = $2 WHERE id = $1",
-                  {Bytes(cmd.conversation.bytes), seq});
+                  {blob(cmd.conversation), seq});
         return Receipt{seq, false};
     });
 }
@@ -450,8 +567,6 @@ Result<Page> SqlStore::read(const Session& session, const Read& query) {
         if (up_to == query.after) {
             return page;
         }
-        // Charge the maximum encoded header plus both length prefixes per record.
-        // Bound the result in SQL so libpq does not buffer an oversized page.
         constexpr auto overhead = static_cast<Sequence>(kHeaderBytes + 8);
         auto rows = db_->query(R"SQL(
             WITH candidates AS (
@@ -462,11 +577,14 @@ Result<Page> SqlStore::read(const Session& session, const Read& query) {
                 SELECT seq, SUM(payload_bytes + $5) OVER (ORDER BY seq) AS page_bytes
                 FROM candidates
             )
-            SELECT e.seq, e.device, e.client_key, e.format, e.payload
+            SELECT e.seq, e.device, e.client_key, e.format, e.payload,
+                   d.account, COALESCE(a.username, ''), COALESCE(a.display_name, '')
             FROM sized JOIN lim_event e ON e.conversation = $1 AND e.seq = sized.seq
+            JOIN lim_device d ON d.id = e.device
+            LEFT JOIN lim_account a ON a.id = d.account
             WHERE sized.page_bytes <= $6 ORDER BY e.seq
         )SQL",
-                               {Bytes(query.conversation.bytes), query.after, up_to,
+                               {blob(query.conversation), query.after, up_to,
                                 static_cast<Sequence>(kPageEvents), overhead,
                                 static_cast<Sequence>(kPageBytes)});
         page.events.reserve(static_cast<std::size_t>(
@@ -478,9 +596,297 @@ Result<Page> SqlStore::read(const Session& session, const Read& query) {
                                    decode_id(rows->bytes(2)),
                                    EventKind::Message,
                                    decode_format(rows->integer(3)),
-                                   {payload.begin(), payload.end()}});
+                                   {payload.begin(), payload.end()},
+                                   decode_id(rows->bytes(5)),
+                                   text(*rows, 6),
+                                   text(*rows, 7)});
         }
         return page;
+    });
+}
+
+Result<StoredAccount> SqlStore::create_account(Id id, std::string_view username,
+                                               std::string_view display_name,
+                                               std::string_view password_hash) {
+    return transact(TransactionMode::Write, [&]() -> Result<StoredAccount> {
+        auto existing = db_->query("SELECT 1 FROM lim_account WHERE id = $1 OR username = $2",
+                                   {blob(id), username});
+        if (existing->next()) {
+            return fail(Error::UsernameTaken);
+        }
+        existing.reset();
+        db_->exec(R"SQL(
+            INSERT INTO lim_account(id, username, display_name, password_hash)
+            VALUES ($1, $2, $3, $4)
+        )SQL",
+                  {blob(id), username, display_name, password_hash});
+        return StoredAccount{id, std::string(username), std::string(display_name),
+                             std::string(password_hash)};
+    });
+}
+
+Result<StoredAccount> SqlStore::account_by_username(std::string_view username) {
+    return transact(TransactionMode::Read, [&]() -> Result<StoredAccount> {
+        auto rows = db_->query(R"SQL(
+            SELECT id, username, display_name, password_hash FROM lim_account
+            WHERE username = $1 AND password_hash IS NOT NULL
+        )SQL",
+                               {username});
+        if (!rows->next()) {
+            return fail(Error::Unauthenticated);
+        }
+        return StoredAccount{decode_id(rows->bytes(0)), text(*rows, 1), text(*rows, 2),
+                             text(*rows, 3)};
+    });
+}
+
+Result<AuthContext> SqlStore::create_login(Id login, Id account, Id device,
+                                           std::string_view device_name, Id credential,
+                                           SecretDigest access_digest,
+                                           SecretDigest refresh_digest, Sequence now,
+                                           Sequence access_expires, Sequence refresh_expires) {
+    return transact(TransactionMode::Write, [&]() -> Result<AuthContext> {
+        auto profile = db_->query(R"SQL(
+            SELECT username, display_name, g.generation FROM lim_account a
+            LEFT JOIN lim_metadata g ON g.singleton = 1 WHERE a.id = $1
+        )SQL",
+                                  {blob(account)});
+        if (!profile->next() || profile->text(0).empty()) {
+            return fail(Error::Unauthenticated);
+        }
+        const auto username = text(*profile, 0);
+        const auto display_name = text(*profile, 1);
+        const auto generation = decode_id(profile->bytes(2));
+        profile.reset();
+        db_->exec(R"SQL(
+            INSERT INTO lim_device(id, account, credential, name, created_at, last_seen)
+            VALUES ($1, $2, $3, $4, $5, $5) ON CONFLICT DO NOTHING
+        )SQL",
+                  {blob(device), blob(account), blob(credential), device_name, now});
+        auto device_row = db_->query(R"SQL(
+            SELECT account, credential, revoked FROM lim_device WHERE id = $1
+        )SQL",
+                                     {blob(device)});
+        if (!device_row->next() || decode_id(device_row->bytes(0)) != account) {
+            return fail(Error::Unauthenticated);
+        }
+        if (device_row->integer(2) != 0) {
+            return fail(Error::DeviceRevoked);
+        }
+        const auto stored_credential = decode_id(device_row->bytes(1));
+        device_row.reset();
+        db_->exec("UPDATE lim_device SET last_seen = $2 WHERE id = $1", {blob(device), now});
+        db_->exec(R"SQL(
+            INSERT INTO lim_auth_session(id, account, device, access_digest, refresh_digest,
+                                         access_expires, refresh_expires, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        )SQL",
+                  {blob(login), blob(account), blob(device), blob(access_digest),
+                   blob(refresh_digest), access_expires, refresh_expires, now});
+        return AuthContext{Session{account, device, generation, stored_credential}, login,
+                           username, display_name, access_expires, refresh_expires};
+    });
+}
+
+Result<AuthContext> SqlStore::rotate_login(SecretDigest old_refresh, SecretDigest access_digest,
+                                           SecretDigest refresh_digest, Sequence now,
+                                           Sequence access_expires, Sequence refresh_expires) {
+    return transact(TransactionMode::Write, [&]() -> Result<AuthContext> {
+        auto rows = db_->query(R"SQL(
+            UPDATE lim_auth_session SET access_digest = $2, refresh_digest = $3,
+                access_expires = $4, refresh_expires = $5
+            WHERE refresh_digest = $1 AND revoked = 0 AND refresh_expires > $6
+            RETURNING id, account, device
+        )SQL",
+                               {blob(old_refresh), blob(access_digest), blob(refresh_digest),
+                                access_expires, refresh_expires, now});
+        if (!rows->next()) {
+            return fail(Error::Unauthenticated);
+        }
+        const auto login = decode_id(rows->bytes(0));
+        const auto account = decode_id(rows->bytes(1));
+        const auto device = decode_id(rows->bytes(2));
+        rows.reset();
+        auto context = db_->query(R"SQL(
+            SELECT a.username, a.display_name, d.credential, d.revoked, g.generation
+            FROM lim_account a JOIN lim_device d ON d.account = a.id
+            LEFT JOIN lim_metadata g ON g.singleton = 1
+            WHERE a.id = $1 AND d.id = $2
+        )SQL",
+                                  {blob(account), blob(device)});
+        if (!context->next() || context->integer(3) != 0) {
+            return fail(Error::DeviceRevoked);
+        }
+        return AuthContext{Session{account, device, decode_id(context->bytes(4)),
+                                   decode_id(context->bytes(2))},
+                           login, text(*context, 0), text(*context, 1), access_expires,
+                           refresh_expires};
+    });
+}
+
+Result<AuthContext> SqlStore::access_session(SecretDigest access_digest, Sequence now) {
+    return transact(TransactionMode::Read, [&]() -> Result<AuthContext> {
+        auto rows = db_->query(R"SQL(
+            SELECT s.id, d.account, d.id, d.credential, a.username, a.display_name,
+                   s.access_expires, s.refresh_expires, d.revoked, s.revoked, g.generation
+            FROM lim_auth_session s JOIN lim_device d ON d.id = s.device
+            JOIN lim_account a ON a.id = d.account
+            LEFT JOIN lim_metadata g ON g.singleton = 1
+            WHERE s.access_digest = $1 AND s.access_expires > $2
+        )SQL",
+                               {blob(access_digest), now});
+        if (!rows->next() || rows->integer(9) != 0) {
+            return fail(Error::Unauthenticated);
+        }
+        if (rows->integer(8) != 0) {
+            return fail(Error::DeviceRevoked);
+        }
+        return AuthContext{Session{decode_id(rows->bytes(1)), decode_id(rows->bytes(2)),
+                                   decode_id(rows->bytes(10)), decode_id(rows->bytes(3))},
+                           decode_id(rows->bytes(0)), text(*rows, 4), text(*rows, 5),
+                           rows->integer(6), rows->integer(7)};
+    });
+}
+
+Result<void> SqlStore::logout(Id login, Id account) {
+    return transact(TransactionMode::Write, [&]() -> Result<void> {
+        auto rows = db_->query(R"SQL(
+            UPDATE lim_auth_session SET revoked = 1
+            WHERE id = $1 AND account = $2 RETURNING id
+        )SQL",
+                               {blob(login), blob(account)});
+        if (!rows->next()) {
+            return fail(Error::Unauthenticated);
+        }
+        return {};
+    });
+}
+
+Result<std::vector<AccountProfile>> SqlStore::search_accounts(const Session& session,
+                                                              std::string_view prefix,
+                                                              Sequence limit) {
+    return transact(TransactionMode::Read, [&]() -> Result<std::vector<AccountProfile>> {
+        if (const auto auth = authenticate(session); !auth) {
+            return std::unexpected(auth.error());
+        }
+        const auto pattern = std::string(prefix) + "%";
+        auto rows = db_->query(R"SQL(
+            SELECT id, username, display_name FROM lim_account
+            WHERE username IS NOT NULL AND username LIKE $1
+            ORDER BY username LIMIT $2
+        )SQL",
+                               {view(pattern), limit});
+        std::vector<AccountProfile> accounts;
+        while (rows->next()) {
+            accounts.push_back({decode_id(rows->bytes(0)), text(*rows, 1), text(*rows, 2)});
+        }
+        return accounts;
+    });
+}
+
+Result<ConversationSummary> SqlStore::start_conversation(const Session& session, Id conversation,
+                                                         std::span<const Id> targets,
+                                                         std::string_view kind,
+                                                         std::string_view title,
+                                                         std::string_view direct_key) {
+    return transact(TransactionMode::Write, [&]() -> Result<ConversationSummary> {
+        if (const auto auth = authenticate(session); !auth) {
+            return std::unexpected(auth.error());
+        }
+        if (!verify_generation(session.generation)) {
+            return fail(Error::RecoveryRequired);
+        }
+        if (!direct_key.empty()) {
+            auto existing = db_->query(R"SQL(
+                SELECT id, last_seq, retained_after FROM lim_conversation
+                WHERE direct_key = $1
+            )SQL",
+                                       {direct_key});
+            if (existing->next()) {
+                const auto id = decode_id(existing->bytes(0));
+                const auto last_seq = existing->integer(1);
+                const auto floor = existing->integer(2);
+                existing.reset();
+                const auto members = conversation_members(id);
+                if (!members) {
+                    return std::unexpected(members.error());
+                }
+                return ConversationSummary{id, floor, last_seq, std::string(kind),
+                                           std::string(title), *members, true};
+            }
+            existing.reset();
+        }
+        std::vector<Id> members;
+        members.push_back(session.account);
+        for (const auto target : targets) {
+            auto found = db_->query(R"SQL(
+                SELECT 1 FROM lim_account WHERE id = $1 AND username IS NOT NULL
+            )SQL",
+                                    {blob(target)});
+            if (!found->next()) {
+                return fail(Error::NotFoundOrForbidden);
+            }
+            found.reset();
+            if (target != session.account) {
+                members.push_back(target);
+            }
+        }
+        db_->exec(R"SQL(
+            INSERT INTO lim_conversation(id, kind, title, direct_key, created_by)
+            VALUES ($1, $2, $3, NULLIF($4, ''), $5)
+        )SQL",
+                  {blob(conversation), kind, title, direct_key, blob(session.account)});
+        for (const auto member : members) {
+            db_->exec(R"SQL(
+                INSERT INTO lim_account_member(conversation, account, joined_after)
+                VALUES ($1, $2, 0) ON CONFLICT DO NOTHING
+            )SQL",
+                      {blob(conversation), blob(member)});
+        }
+        const auto profiles = conversation_members(conversation);
+        if (!profiles) {
+            return std::unexpected(profiles.error());
+        }
+        return ConversationSummary{conversation, 0, 0, std::string(kind), std::string(title),
+                                   *profiles, true};
+    });
+}
+
+Result<std::vector<DeviceSummary>> SqlStore::list_devices(const Session& session) {
+    return transact(TransactionMode::Read, [&]() -> Result<std::vector<DeviceSummary>> {
+        if (const auto auth = authenticate(session); !auth) {
+            return std::unexpected(auth.error());
+        }
+        auto rows = db_->query(R"SQL(
+            SELECT id, name, created_at, last_seen, revoked FROM lim_device
+            WHERE account = $1 ORDER BY created_at, id
+        )SQL",
+                               {blob(session.account)});
+        std::vector<DeviceSummary> devices;
+        while (rows->next()) {
+            devices.push_back({decode_id(rows->bytes(0)), text(*rows, 1), rows->integer(2),
+                               rows->integer(3), rows->integer(4) != 0});
+        }
+        return devices;
+    });
+}
+
+Result<void> SqlStore::remove_device(const Session& session, Id device) {
+    return transact(TransactionMode::Write, [&]() -> Result<void> {
+        if (const auto auth = authenticate(session); !auth) {
+            return auth;
+        }
+        auto rows = db_->query(R"SQL(
+            UPDATE lim_device SET revoked = 1 WHERE id = $1 AND account = $2 RETURNING id
+        )SQL",
+                               {blob(device), blob(session.account)});
+        if (!rows->next()) {
+            return fail(Error::NotFoundOrForbidden);
+        }
+        rows.reset();
+        db_->exec("DELETE FROM lim_member WHERE device = $1", {blob(device)});
+        db_->exec("UPDATE lim_auth_session SET revoked = 1 WHERE device = $1", {blob(device)});
+        return {};
     });
 }
 
@@ -543,6 +949,7 @@ std::expected<void, StorageOpenError> apply_recovery(Database& db,
                 {Bytes(session.device.bytes), Bytes(session.credential.bytes)});
     }
     db.exec("DELETE FROM lim_member WHERE device IN (SELECT id FROM lim_device WHERE revoked = 1)");
+    db.exec("UPDATE lim_auth_session SET revoked = 1");
     db.exec("UPDATE lim_metadata SET generation = $1 WHERE singleton = 1",
             {Bytes(recovery.new_generation.bytes)});
     transaction.commit();

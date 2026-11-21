@@ -1,10 +1,12 @@
 module;
+#include <array>
 #include <expected>
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -22,6 +24,7 @@ struct PostgresOptions {
 };
 
 using StorageOptions = std::variant<SqliteOptions, PostgresOptions>;
+using SecretDigest = std::array<std::byte, 32>;
 
 enum class StorageOpenError {
     InvalidConfiguration,
@@ -39,10 +42,44 @@ struct StorageRecovery {
     std::span<const Session> reviewed_devices;
 };
 
+struct AccountProfile {
+    Id id;
+    std::string username;
+    std::string display_name;
+};
+
+struct StoredAccount {
+    Id id;
+    std::string username;
+    std::string display_name;
+    std::string password_hash;
+};
+
+struct AuthContext {
+    Session session;
+    Id login;
+    std::string username;
+    std::string display_name;
+    Sequence access_expires;
+    Sequence refresh_expires;
+};
+
+struct DeviceSummary {
+    Id id;
+    std::string name;
+    Sequence created_at;
+    Sequence last_seen;
+    bool revoked;
+};
+
 struct ConversationSummary {
     Id id;
     Sequence after;
     Sequence last_seq;
+    std::string kind = "host";
+    std::string title;
+    std::vector<AccountProfile> members;
+    bool account_scoped = false;
 };
 
 struct ConversationPage {
@@ -65,6 +102,29 @@ class Store : public Chat {
                                                                       std::optional<Id> after) = 0;
     [[nodiscard]] virtual Result<ConversationSummary> conversation_summary(const Session& session,
                                                                            Id conversation) = 0;
+
+    [[nodiscard]] virtual Result<StoredAccount> create_account(Id id, std::string_view username,
+                                                               std::string_view display_name,
+                                                               std::string_view password_hash) = 0;
+    [[nodiscard]] virtual Result<StoredAccount> account_by_username(std::string_view username) = 0;
+    [[nodiscard]] virtual Result<AuthContext>
+    create_login(Id login, Id account, Id device, std::string_view device_name, Id credential,
+                 SecretDigest access_digest, SecretDigest refresh_digest, Sequence now,
+                 Sequence access_expires, Sequence refresh_expires) = 0;
+    [[nodiscard]] virtual Result<AuthContext>
+    rotate_login(SecretDigest old_refresh, SecretDigest access_digest, SecretDigest refresh_digest,
+                 Sequence now, Sequence access_expires, Sequence refresh_expires) = 0;
+    [[nodiscard]] virtual Result<AuthContext> access_session(SecretDigest access_digest,
+                                                             Sequence now) = 0;
+    [[nodiscard]] virtual Result<void> logout(Id login, Id account) = 0;
+    [[nodiscard]] virtual Result<std::vector<AccountProfile>>
+    search_accounts(const Session& session, std::string_view prefix, Sequence limit) = 0;
+    [[nodiscard]] virtual Result<ConversationSummary>
+    start_conversation(const Session& session, Id conversation, std::span<const Id> targets,
+                       std::string_view kind, std::string_view title,
+                       std::string_view direct_key) = 0;
+    [[nodiscard]] virtual Result<std::vector<DeviceSummary>> list_devices(const Session& session) = 0;
+    [[nodiscard]] virtual Result<void> remove_device(const Session& session, Id device) = 0;
 };
 
 // Opens a file or a dedicated PostgreSQL database. Initializes an empty store with
